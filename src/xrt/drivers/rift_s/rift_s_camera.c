@@ -393,6 +393,7 @@ receive_cam_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 		RIFT_S_WARN("Camera frame TS didn't advance. Probably the headset crashed");
 		return;
 	}
+	cam->last_frame_ts_ns = frame_ts_ns;
 
 	// If the top left pixel is > 128, send as SLAM frame else controller
 	if (row_data.data.frame_type & 0x80) {
