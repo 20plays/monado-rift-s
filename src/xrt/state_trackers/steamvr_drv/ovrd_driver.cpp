@@ -51,8 +51,10 @@ extern "C" {
 //! compatibility with legacy games due to steamvr's legacy binding for Index
 //! controllers, but input mapping may be incomplete or not ideal.
 DEBUG_GET_ONCE_BOOL_OPTION(emulate_index_controller, "STEAMVR_EMULATE_INDEX_CONTROLLER", false)
-
 DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "XRT_COMPOSITOR_SCALE_PERCENTAGE", 140)
+DEBUG_GET_ONCE_FLOAT_OPTION(tracking_origin_offset_x, "XRT_TRACKING_ORIGIN_OFFSET_X", 0.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(tracking_origin_offset_y, "XRT_TRACKING_ORIGIN_OFFSET_Y", 0.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(tracking_origin_offset_z, "XRT_TRACKING_ORIGIN_OFFSET_Z", 0.0f)
 
 #define MODELNUM_LEN (XRT_DEVICE_NAME_LEN + 9) // "[Monado] "
 
@@ -915,6 +917,12 @@ public:
 
 			m_input_profile = std::string("{monado}/input/") + std::string(p->steamvr_input_profile_path);
 			m_controller_type = p->steamvr_controller_type;
+			if (m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER ||
+			    m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_RIFT_CV1 ||
+			    m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_QUEST_1_RIFT_S ||
+			    m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_QUEST_2) {
+				m_controller_type = "oculus_touch";
+			}
 		}
 
 		ovrd_log("Using input profile %s\n", m_input_profile.c_str());
@@ -1026,11 +1034,37 @@ public:
 		struct xrt_space_relation rel;
 		xrt_device_get_tracked_pose(m_xdev, grip_name, now_ns, &rel);
 
+		if (m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER ||
+		    m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_RIFT_CV1 ||
+		    m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_QUEST_1_RIFT_S ||
+		    m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_QUEST_2) {
+			// SteamVR's oculus_rifts_controller defines openxr_aim relative to driver pose as:
+			//   rotate_xyz: [-39.4, 0, 0]
+			//   origin: [+/-0.007, -0.03894766, 0.00949694]
+			// To convert from OpenXR aim pose to SteamVR Touch driver pose, apply (openxr_aim)^-1:
+			struct xrt_pose P_aim_driver;
+			struct xrt_vec3 axis = {1.0f, 0.0f, 0.0f};
+			math_quat_from_angle_vector(DEG_TO_RAD(39.4f), &axis, &P_aim_driver.orientation);
+			float sign_x = (m_hand == XRT_HAND_LEFT) ? -1.0f : 1.0f;
+			struct xrt_vec3 t = {sign_x * 0.007f, -0.03894766f, 0.00949694f};
+			struct xrt_quat q_inv;
+			math_quat_invert(&P_aim_driver.orientation, &q_inv);
+			math_quat_rotate_vec3(&q_inv, &t, &P_aim_driver.position);
+			P_aim_driver.position.x = -P_aim_driver.position.x;
+			P_aim_driver.position.y = -P_aim_driver.position.y;
+			P_aim_driver.position.z = -P_aim_driver.position.z;
+
+			struct xrt_relation_chain aim_chain = {};
+			m_relation_chain_push_relation(&aim_chain, &rel);
+			m_relation_chain_push_pose(&aim_chain, &P_aim_driver);
+			m_relation_chain_resolve(&aim_chain, &rel);
+		}
+
 		struct xrt_pose *offset = &m_xdev->tracking_origin->initial_offset;
 
 		struct xrt_relation_chain chain = {};
-		m_relation_chain_push_relation(&chain, &rel);
 		m_relation_chain_push_pose_if_not_identity(&chain, offset);
+		m_relation_chain_push_relation(&chain, &rel);
 		m_relation_chain_resolve(&chain, &rel);
 
 		apply_pose(&rel, &m_pose);
@@ -1442,8 +1476,8 @@ CDeviceDriver_Monado::GetPose()
 	struct xrt_pose *offset = &m_xdev->tracking_origin->initial_offset;
 
 	struct xrt_relation_chain chain = {};
-	m_relation_chain_push_relation(&chain, &rel);
 	m_relation_chain_push_pose_if_not_identity(&chain, offset);
+	m_relation_chain_push_relation(&chain, &rel);
 	m_relation_chain_resolve(&chain, &rel);
 
 	vr::DriverPose_t t = {
@@ -1692,8 +1726,11 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 		right_xdev = m_xsysd->xdevs[system_roles.right];
 	}
 
-	// use steamvr room setup instead
-	struct xrt_vec3 offset = {0, 0, 0};
+	struct xrt_vec3 offset = {
+	    debug_get_float_option_tracking_origin_offset_x(),
+	    debug_get_float_option_tracking_origin_offset_y(),
+	    debug_get_float_option_tracking_origin_offset_z(),
+	};
 	u_builder_setup_tracking_origins(m_xhmd, nullptr, left_xdev, right_xdev, nullptr, &offset);
 
 	if (left_xdev) {

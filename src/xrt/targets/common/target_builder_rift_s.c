@@ -45,6 +45,7 @@ enum u_logging_level rift_s_log_level;
  */
 
 DEBUG_GET_ONCE_LOG_OPTION(rift_s_log, "RIFT_S_LOG", U_LOGGING_WARN)
+DEBUG_GET_ONCE_FLOAT_OPTION(rift_s_floor_offset_y, "RIFT_S_FLOOR_OFFSET_Y", 1.6f)
 
 #ifdef XRT_BUILD_DRIVER_HANDTRACKING
 DEBUG_GET_ONCE_BOOL_OPTION(rift_s_hand_tracking_as_controller, "RIFT_S_HAND_TRACKING_AS_CONTROLLERS", false)
@@ -166,7 +167,7 @@ rift_s_open_system_impl(struct xrt_builder *xb,
 	/* We'll give everyone a shared tracking origin using the system allocated one */
 	origin->type = XRT_TRACKING_TYPE_OTHER;
 	origin->initial_offset.orientation.w = 1.0f;
-	origin->initial_offset.position.y = 1.6;
+	origin->initial_offset.position.y = debug_get_float_option_rift_s_floor_offset_y();
 	snprintf(origin->name, XRT_TRACKING_NAME_LEN, "%s", "Oculus Rift S SLAM Tracking");
 
 	// Create and add to list.

@@ -574,21 +574,8 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 	struct xrt_relation_chain xrc = {0};
 
 	os_mutex_lock(&ctrl->mutex);
-	if (ctrl->flip_left_yaw) {
-		struct xrt_pose flip = {
-		    .orientation = {.x = 0.0f, .y = 1.0f, .z = 0.0f, .w = 0.0f},
-		    .position = {0.0f, 0.0f, 0.0f},
-		};
-		m_relation_chain_push_pose(&xrc, &flip);
-	}
-	if (name == XRT_INPUT_TOUCH_AIM_POSE) {
-		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
-	} else if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
-		m_relation_chain_push_pose(&xrc, &ctrl->P_aim_grip);
-		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
-	}
 
-	/* Apply the fusion rotation */
+	/* Reserve the base tracked relation first so it is step 0 */
 	struct xrt_space_relation *rel = m_relation_chain_reserve(&xrc);
 
 	rift_s_controller_get_fusion_pose(ctrl, name, at_timestamp_ns, rel);
@@ -616,6 +603,21 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 				rel->pose.position.z += ctrl->linear_velocity.z * dt;
 			}
 		}
+	}
+
+	/* Now push child offsets in device space */
+	m_relation_chain_push_pose_if_not_identity(&xrc, &ctrl->P_imu_device);
+
+	if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
+		m_relation_chain_push_pose(&xrc, &ctrl->P_aim_grip);
+	}
+
+	if (ctrl->flip_left_yaw) {
+		struct xrt_pose flip = {
+		    .orientation = {.x = 0.0f, .y = 1.0f, .z = 0.0f, .w = 0.0f},
+		    .position = {0.0f, 0.0f, 0.0f},
+		};
+		m_relation_chain_push_pose(&xrc, &flip);
 	}
 	os_mutex_unlock(&ctrl->mutex);
 
@@ -718,31 +720,40 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		time_duration_ns dt_ns = frame_mono_ns - prev_ts;
 		// Normal inter-frame interval for ~30 FPS camera is ~33ms (allow 15ms to 150ms)
 		if (dt_ns >= 15 * U_TIME_1MS_IN_NS && dt_ns <= 150 * U_TIME_1MS_IN_NS) {
-			float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
-			struct xrt_vec3 inst_vel = {
-			    .x = (filtered_pos.x - prev_pose.position.x) / dt,
-			    .y = (filtered_pos.y - prev_pose.position.y) / dt,
-			    .z = (filtered_pos.z - prev_pose.position.z) / dt,
-			};
-			// Clamp velocity to human limits (4.0 m/s) to prevent numerical spikes
-			float speed = m_vec3_len(inst_vel);
-			if (speed > 4.0f) {
-				float s = 4.0f / speed;
-				inst_vel.x *= s;
-				inst_vel.y *= s;
-				inst_vel.z *= s;
-			}
-			if (ctrl->have_linear_velocity) {
-				const float alpha = 0.35f;
-				ctrl->linear_velocity.x =
-				    alpha * inst_vel.x + (1.0f - alpha) * ctrl->linear_velocity.x;
-				ctrl->linear_velocity.y =
-				    alpha * inst_vel.y + (1.0f - alpha) * ctrl->linear_velocity.y;
-				ctrl->linear_velocity.z =
-				    alpha * inst_vel.z + (1.0f - alpha) * ctrl->linear_velocity.z;
+			struct xrt_vec3 pos_diff = m_vec3_sub(filtered_pos, prev_pose.position);
+			float step_dist = m_vec3_len(pos_diff);
+			if (step_dist > 0.20f && dt_ns < 50 * U_TIME_1MS_IN_NS) {
+				// Sudden unphysical teleport (> 20cm in < 50ms) - reset velocity to prevent runaway extrapolation
+				ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
+				ctrl->have_linear_velocity = false;
+				ctrl->pos_filter_initialized = false;
 			} else {
-				ctrl->linear_velocity = inst_vel;
-				ctrl->have_linear_velocity = true;
+				float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
+				struct xrt_vec3 inst_vel = {
+				    .x = (filtered_pos.x - prev_pose.position.x) / dt,
+				    .y = (filtered_pos.y - prev_pose.position.y) / dt,
+				    .z = (filtered_pos.z - prev_pose.position.z) / dt,
+				};
+				// Clamp velocity to human limits (4.0 m/s) to prevent numerical spikes
+				float speed = m_vec3_len(inst_vel);
+				if (speed > 4.0f) {
+					float s = 4.0f / speed;
+					inst_vel.x *= s;
+					inst_vel.y *= s;
+					inst_vel.z *= s;
+				}
+				if (ctrl->have_linear_velocity) {
+					const float alpha = 0.35f;
+					ctrl->linear_velocity.x =
+					    alpha * inst_vel.x + (1.0f - alpha) * ctrl->linear_velocity.x;
+					ctrl->linear_velocity.y =
+					    alpha * inst_vel.y + (1.0f - alpha) * ctrl->linear_velocity.y;
+					ctrl->linear_velocity.z =
+					    alpha * inst_vel.z + (1.0f - alpha) * ctrl->linear_velocity.z;
+				} else {
+					ctrl->linear_velocity = inst_vel;
+					ctrl->have_linear_velocity = true;
+				}
 			}
 		} else if (dt_ns > 150 * U_TIME_1MS_IN_NS) {
 			// After tracking loss / freeze, reset velocity so the recovery teleport doesn't cause a spike

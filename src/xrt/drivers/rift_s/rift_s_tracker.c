@@ -366,6 +366,10 @@ rift_s_tracker_add_debug_ui(struct rift_s_tracker *t, void *root)
 {
 	u_var_add_gui_header(root, NULL, "Tracking");
 
+	if (t->base.tracking_origin != NULL) {
+		u_var_add_f32(root, &t->base.tracking_origin->initial_offset.position.y, "Floor Height (Y Offset)");
+	}
+
 	if (t->tracking.slam_enabled) {
 		t->gui.switch_tracker_btn.cb = rift_s_tracker_switch_method_cb;
 		t->gui.switch_tracker_btn.ptr = t;
