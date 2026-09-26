@@ -16,6 +16,7 @@
 #define RIFT_S_CONTROLLER_H
 
 #include "math/m_imu_3dof.h"
+#include "math/m_filter_one_euro.h"
 
 #include "os/os_time.h"
 #include "tracking/t_constellation_tracking.h"
@@ -60,6 +61,9 @@ struct rift_s_controller
 	//! Filtered linear velocity from optical observations
 	struct xrt_vec3 linear_velocity;
 	bool have_linear_velocity;
+	//! One-Euro position filter for optical observations
+	struct m_filter_euro_vec3 pos_filter;
+	bool pos_filter_initialized;
 	//! debug boolean - enable yaw updates
 	bool update_yaw_from_optical;
 

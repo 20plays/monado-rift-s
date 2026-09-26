@@ -574,8 +574,8 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 	if (name == XRT_INPUT_TOUCH_AIM_POSE) {
 		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
 	} else if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
-		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
 		m_relation_chain_push_pose(&xrc, &ctrl->P_aim_grip);
+		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
 	}
 
 	/* Apply the fusion rotation */
@@ -592,12 +592,13 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 			rel->relation_flags |=
 			    (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
 
-			// Extrapolate position between 30 Hz optical frames
-			if (at_timestamp_ns > ctrl->last_tracked_pose_ts) {
+			// Extrapolate position between 30 Hz optical frames only if moving (deadband 0.04 m/s)
+			float speed = m_vec3_len(ctrl->linear_velocity);
+			if (speed > 0.04f && at_timestamp_ns > ctrl->last_tracked_pose_ts) {
 				time_duration_ns dt_ns = at_timestamp_ns - ctrl->last_tracked_pose_ts;
-				// Cap extrapolation at 50ms (1.5 camera frames) to prevent overshoot
-				if (dt_ns > 50 * U_TIME_1MS_IN_NS) {
-					dt_ns = 50 * U_TIME_1MS_IN_NS;
+				// Cap extrapolation at 35ms (~1 frame) to prevent overshoot
+				if (dt_ns > 35 * U_TIME_1MS_IN_NS) {
+					dt_ns = 35 * U_TIME_1MS_IN_NS;
 				}
 				float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
 				rel->pose.position.x += ctrl->linear_velocity.x * dt;
@@ -665,8 +666,8 @@ rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_
 		struct t_constellation_led *led = led_model->leds + i;
 		struct xrt_vec3 pos, dir;
 
-		math_pose_transform_point(&ctrl->P_device_imu, &ctrl->calibration.leds[i].pos, &pos);
-		math_quat_rotate_vec3(&ctrl->P_device_imu.orientation, &ctrl->calibration.leds[i].dir, &dir);
+		math_pose_transform_point(&ctrl->P_imu_device, &ctrl->calibration.leds[i].pos, &pos);
+		math_quat_rotate_vec3(&ctrl->P_imu_device.orientation, &ctrl->calibration.leds[i].dir, &dir);
 
 		led->id = i;
 		led->pos.x = pos.x;
@@ -688,11 +689,20 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
 	os_mutex_lock(&ctrl->mutex);
 
+	// Run optical position observation through One-Euro filter to remove 30 Hz camera sensor discretization noise
+	struct xrt_vec3 filtered_pos;
+	if (!ctrl->pos_filter_initialized) {
+		m_filter_euro_vec3_init(&ctrl->pos_filter, 1.2, 1.0, 0.03);
+		ctrl->pos_filter_initialized = true;
+	}
+	m_filter_euro_vec3_run(&ctrl->pos_filter, (uint64_t)frame_mono_ns, &pose->position, &filtered_pos);
+
 	timepoint_ns prev_ts = ctrl->last_tracked_pose_ts;
 	struct xrt_pose prev_pose = ctrl->last_tracked_pose;
 
 	ctrl->last_tracked_pose_ts = frame_mono_ns;
-	ctrl->last_tracked_pose = *pose;
+	ctrl->last_tracked_pose.position = filtered_pos;
+	ctrl->last_tracked_pose.orientation = pose->orientation;
 
 	if (prev_ts != 0 && frame_mono_ns > prev_ts) {
 		time_duration_ns dt_ns = frame_mono_ns - prev_ts;
@@ -700,12 +710,20 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		if (dt_ns >= 15 * U_TIME_1MS_IN_NS && dt_ns <= 150 * U_TIME_1MS_IN_NS) {
 			float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
 			struct xrt_vec3 inst_vel = {
-			    .x = (pose->position.x - prev_pose.position.x) / dt,
-			    .y = (pose->position.y - prev_pose.position.y) / dt,
-			    .z = (pose->position.z - prev_pose.position.z) / dt,
+			    .x = (filtered_pos.x - prev_pose.position.x) / dt,
+			    .y = (filtered_pos.y - prev_pose.position.y) / dt,
+			    .z = (filtered_pos.z - prev_pose.position.z) / dt,
 			};
+			// Clamp velocity to human limits (4.0 m/s) to prevent numerical spikes
+			float speed = m_vec3_len(inst_vel);
+			if (speed > 4.0f) {
+				float s = 4.0f / speed;
+				inst_vel.x *= s;
+				inst_vel.y *= s;
+				inst_vel.z *= s;
+			}
 			if (ctrl->have_linear_velocity) {
-				const float alpha = 0.6f;
+				const float alpha = 0.35f;
 				ctrl->linear_velocity.x =
 				    alpha * inst_vel.x + (1.0f - alpha) * ctrl->linear_velocity.x;
 				ctrl->linear_velocity.y =
@@ -720,48 +738,46 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			// After tracking loss / freeze, reset velocity so the recovery teleport doesn't cause a spike
 			ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
 			ctrl->have_linear_velocity = false;
+			ctrl->pos_filter_initialized = false;
 		}
 	}
 
 	if (ctrl->update_yaw_from_optical) {
-		// Apply 5% of observed orientation yaw to 3dof fusion
-		// FIXME: Do better
-		struct xrt_quat delta;
-		math_quat_unrotate(&ctrl->fusion.rot, &pose->orientation, &delta);
-		delta.x = delta.z = 0.0; // We only want Yaw
+		// Only correct yaw if the controller is relatively stationary.
+		// When the hand is rotating, the 1000 Hz gyroscope has zero latency
+		// whereas optical orientation is 20-30 ms stale. Snapping during motion
+		// causes severe rotational hitching.
+		float gyro_speed = m_vec3_len(ctrl->fusion.last.gyro);
+		if (gyro_speed < 0.15f) { // < ~8.6 deg/s
+			// Calculate orientation error in WORLD coordinates:
+			// q_err = q_optical * q_fusion^-1
+			struct xrt_quat fusion_inv;
+			math_quat_invert(&ctrl->fusion.rot, &fusion_inv);
+			struct xrt_quat q_err;
+			math_quat_rotate(&pose->orientation, &fusion_inv, &q_err);
 
-		if (fabs(delta.y) > sin(DEG_TO_RAD(5)) / 2) {
-			delta.y = sin(0.10 * asinf(delta.y)); // 10% correction
-			math_quat_normalize(&delta);
+			// In OpenXR world space, +Y is UP (gravity axis).
+			// Extract pure rotation around World Y:
+			struct xrt_quat q_yaw = {
+			    .x = 0.0f,
+			    .y = q_err.y,
+			    .z = 0.0f,
+			    .w = q_err.w,
+			};
+			math_quat_normalize(&q_yaw);
 
-			struct xrt_quat prev = ctrl->fusion.rot;
-			math_quat_rotate(&ctrl->fusion.rot, &delta, &ctrl->fusion.rot);
+			// Apply a gentle complementary filter nudge (2% per 33 ms frame)
+			struct xrt_quat correction;
+			const struct xrt_quat id = XRT_QUAT_IDENTITY;
+			math_quat_slerp(&id, &q_yaw, 0.02f, &correction);
 
-			if (rift_s_log_level <= U_LOGGING_DEBUG) {
-				struct xrt_quat post_delta;
-				math_quat_unrotate(&ctrl->fusion.rot, &pose->orientation, &post_delta);
-				post_delta.x = post_delta.z = 0.0;  // We only want Yaw
-				post_delta.y = 0.10 * post_delta.y; // 5%
-				math_quat_normalize(&post_delta);
-
-				RIFT_S_DEBUG(
-				    "Applying delta yaw rotation of %f degrees delta quat %f,%f,%f,%f from "
-				    "%f,%f,%f,%f to "
-				    "%f,%f,%f,%f. delta after correction: %f,%f,%f,%f",
-				    RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w, prev.x, prev.y,
-				    prev.z, prev.w, ctrl->fusion.rot.x, ctrl->fusion.rot.y, ctrl->fusion.rot.z,
-				    ctrl->fusion.rot.w, post_delta.x, post_delta.y, post_delta.z, post_delta.w);
-			}
-		} else if (fabs(delta.y) > sin(DEG_TO_RAD(0.25)) / 2) {
-			math_quat_normalize(&delta);
-
-			RIFT_S_DEBUG("Applying full yaw correction of %f degrees. delta quat %f,%f,%f,%f",
-			             RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w);
-			math_quat_rotate(&ctrl->fusion.rot, &delta, &ctrl->fusion.rot);
+			// Apply correction on the left (in world space):
+			// q_fusion_new = correction * q_fusion
+			math_quat_rotate(&correction, &ctrl->fusion.rot, &ctrl->fusion.rot);
 		}
 	}
 	// Update pose position for the debug UI
-	ctrl->pose.position = pose->position;
+	ctrl->pose.position = filtered_pos;
 	os_mutex_unlock(&ctrl->mutex);
 }
 
@@ -788,11 +804,12 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 
 	os_mutex_init(&ctrl->mutex);
 
-	/* Default grip pose up by 40° degrees around the X axis and back about 10cm in Z */
-	struct xrt_vec3 translation = {0.0, 0, 0.1};
+	/* Default grip pose up by 40° degrees around the X axis and 3.5cm down handle in Z */
+	struct xrt_vec3 translation = {0.0f, -0.015f, 0.035f};
 	struct xrt_vec3 axis = {1.0, 0, 0};
 	math_quat_from_angle_vector(DEG_TO_RAD(40), &axis, &ctrl->P_aim_grip.orientation);
 	ctrl->P_aim_grip.position = translation;
+	ctrl->pos_filter_initialized = false;
 
 	u_device_populate_function_pointers(&ctrl->base, rift_s_controller_get_tracked_pose, rift_s_controller_destroy);
 	ctrl->base.update_inputs = rift_s_controller_update_inputs;
