@@ -592,13 +592,13 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 			rel->relation_flags |=
 			    (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
 
-			// Extrapolate position between 30 Hz optical frames only if moving (deadband 0.02 m/s)
+			// Extrapolate position between 30 Hz optical frames only if moving (deadband 0.04 m/s)
 			float speed = m_vec3_len(ctrl->linear_velocity);
-			if (speed > 0.02f && at_timestamp_ns > ctrl->last_tracked_pose_ts) {
+			if (speed > 0.04f && at_timestamp_ns > ctrl->last_tracked_pose_ts) {
 				time_duration_ns dt_ns = at_timestamp_ns - ctrl->last_tracked_pose_ts;
-				// Cap extrapolation at 60ms to cover USB latency, solver, and 80 Hz display prediction
-				if (dt_ns > 60 * U_TIME_1MS_IN_NS) {
-					dt_ns = 60 * U_TIME_1MS_IN_NS;
+				// Cap extrapolation at 35ms (~1 frame) to prevent overshoot
+				if (dt_ns > 35 * U_TIME_1MS_IN_NS) {
+					dt_ns = 35 * U_TIME_1MS_IN_NS;
 				}
 				float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
 				rel->pose.position.x += ctrl->linear_velocity.x * dt;
@@ -692,7 +692,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	// Run optical position observation through One-Euro filter to remove 30 Hz camera sensor discretization noise
 	struct xrt_vec3 filtered_pos;
 	if (!ctrl->pos_filter_initialized) {
-		m_filter_euro_vec3_init(&ctrl->pos_filter, 1.8, 1.5, 4.0);
+		m_filter_euro_vec3_init(&ctrl->pos_filter, 1.2, 1.0, 0.03);
 		ctrl->pos_filter_initialized = true;
 	}
 	m_filter_euro_vec3_run(&ctrl->pos_filter, (uint64_t)frame_mono_ns, &pose->position, &filtered_pos);
@@ -723,7 +723,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				inst_vel.z *= s;
 			}
 			if (ctrl->have_linear_velocity) {
-				const float alpha = 0.70f;
+				const float alpha = 0.35f;
 				ctrl->linear_velocity.x =
 				    alpha * inst_vel.x + (1.0f - alpha) * ctrl->linear_velocity.x;
 				ctrl->linear_velocity.y =
