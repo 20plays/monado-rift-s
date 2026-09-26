@@ -574,8 +574,19 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 	struct xrt_relation_chain xrc = {0};
 
 	os_mutex_lock(&ctrl->mutex);
+	if (ctrl->flip_left_yaw) {
+		struct xrt_pose flip = {
+		    .orientation = {.x = 0.0f, .y = 1.0f, .z = 0.0f, .w = 0.0f},
+		    .position = {0.0f, 0.0f, 0.0f},
+		};
+		m_relation_chain_push_pose(&xrc, &flip);
+	}
+	if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
+		m_relation_chain_push_pose(&xrc, &ctrl->P_aim_grip);
+	}
+	m_relation_chain_push_pose_if_not_identity(&xrc, &ctrl->P_imu_device);
 
-	/* Reserve the base tracked relation first so it is step 0 */
+	/* Apply the fusion rotation */
 	struct xrt_space_relation *rel = m_relation_chain_reserve(&xrc);
 
 	rift_s_controller_get_fusion_pose(ctrl, name, at_timestamp_ns, rel);
@@ -603,21 +614,6 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 				rel->pose.position.z += ctrl->linear_velocity.z * dt;
 			}
 		}
-	}
-
-	/* Now push child offsets in device space */
-	m_relation_chain_push_pose_if_not_identity(&xrc, &ctrl->P_imu_device);
-
-	if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
-		m_relation_chain_push_pose(&xrc, &ctrl->P_aim_grip);
-	}
-
-	if (ctrl->flip_left_yaw) {
-		struct xrt_pose flip = {
-		    .orientation = {.x = 0.0f, .y = 1.0f, .z = 0.0f, .w = 0.0f},
-		    .position = {0.0f, 0.0f, 0.0f},
-		};
-		m_relation_chain_push_pose(&xrc, &flip);
 	}
 	os_mutex_unlock(&ctrl->mutex);
 
