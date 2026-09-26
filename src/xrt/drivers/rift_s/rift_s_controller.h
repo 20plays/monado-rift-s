@@ -116,10 +116,12 @@ struct rift_s_controller
 
 	bool reading_config;
 	bool have_config;
+	timepoint_ns last_config_attempt_ns;
 	rift_s_controller_config config;
 
 	bool reading_calibration;
 	bool have_calibration;
+	timepoint_ns last_calibration_attempt_ns;
 	struct rift_s_controller_imu_calibration calibration;
 };
 

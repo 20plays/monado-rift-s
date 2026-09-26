@@ -28,6 +28,7 @@
 #include "os/os_hid.h"
 
 #include "util/u_device.h"
+#include "util/u_time.h"
 #include "util/u_trace_marker.h"
 #include "util/u_var.h"
 
@@ -352,14 +353,19 @@ static void
 ctrl_config_cb(bool success, uint8_t *response_bytes, int response_bytes_len, struct rift_s_controller *ctrl)
 {
 	if (!success) {
-		RIFT_S_WARN("Failed to read controller config");
+		os_mutex_lock(&ctrl->mutex);
+		ctrl->reading_config = false;
+		os_mutex_unlock(&ctrl->mutex);
+		RIFT_S_WARN("Failed to read config for controller 0x%016" PRIx64 "; will retry", ctrl->device_id);
 		return;
 	}
 
-	ctrl->reading_config = false;
-
 	if (response_bytes_len < 5) {
-		RIFT_S_WARN("Failed to read controller config - short result");
+		os_mutex_lock(&ctrl->mutex);
+		ctrl->reading_config = false;
+		os_mutex_unlock(&ctrl->mutex);
+		RIFT_S_WARN("Failed to read config for controller 0x%016" PRIx64 " (short result %d bytes); will retry",
+		            ctrl->device_id, response_bytes_len);
 		return;
 	}
 
@@ -378,10 +384,17 @@ ctrl_config_cb(bool success, uint8_t *response_bytes, int response_bytes_len, st
 		printed += rift_s_snprintf_hexdump_buffer(buf + printed, bufsize - printed, "Controller Config",
 		                                          response_bytes, response_bytes_len);
 
-		RIFT_S_ERROR("Failed to read controller config block - only got %d bytes\n%s", response_bytes_len, buf);
+		os_mutex_lock(&ctrl->mutex);
+		ctrl->reading_config = false;
+		os_mutex_unlock(&ctrl->mutex);
+		RIFT_S_WARN("Failed to read config block for controller 0x%016" PRIx64 " (got %d bytes); will retry\n%s",
+		            ctrl->device_id, response_bytes_len, buf);
 		return;
 	}
 	response_bytes += 5;
+
+	os_mutex_lock(&ctrl->mutex);
+	ctrl->reading_config = false;
 
 	ctrl->config.accel_limit = READ_LE16(response_bytes + 0);
 	ctrl->config.gyro_limit = READ_LE16(response_bytes + 2);
@@ -391,8 +404,9 @@ ctrl_config_cb(bool success, uint8_t *response_bytes, int response_bytes_len, st
 	ctrl->config.gyro_scale = READ_LEFLOAT32(response_bytes + 12);
 
 	ctrl->have_config = true;
+	os_mutex_unlock(&ctrl->mutex);
 
-	RIFT_S_INFO("Read config for controller 0x%16" PRIx64
+	RIFT_S_INFO("Read config for controller 0x%016" PRIx64
 	            " type %08x. "
 	            "limit/scale/hz Accel %u %f %u Gyro %u %f %u",
 	            ctrl->device_id, ctrl->device_type, ctrl->config.accel_limit, ctrl->config.accel_scale,
@@ -403,7 +417,11 @@ static void
 ctrl_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, struct rift_s_controller *ctrl)
 {
 	if (!success) {
-		RIFT_S_DEBUG("Failed to read controller calibration block");
+		os_mutex_lock(&ctrl->mutex);
+		ctrl->reading_calibration = false;
+		os_mutex_unlock(&ctrl->mutex);
+		RIFT_S_WARN("Failed to read calibration block for controller 0x%016" PRIx64 "; will retry",
+		            ctrl->device_id);
 		return;
 	}
 
@@ -417,8 +435,8 @@ ctrl_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, stru
 		math_pose_invert(&ctrl->P_device_imu, &ctrl->P_imu_device);
 		ctrl->have_calibration = true;
 	} else {
-		RIFT_S_ERROR("Failed to parse controller configuration for controller 0x%16" PRIx64 "\n",
-		             ctrl->device_id);
+		RIFT_S_WARN("Failed to parse calibration for controller 0x%016" PRIx64 "; will retry",
+		            ctrl->device_id);
 	}
 	os_mutex_unlock(&ctrl->mutex);
 }
@@ -820,27 +838,41 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 	return ctrl;
 }
 
+#define RIFT_S_CONFIG_RETRY_INTERVAL_NS (1 * U_TIME_1S_IN_NS)
+
 void
 rift_s_controller_update_configuration(struct rift_s_controller *ctrl, uint64_t device_id)
 {
 	rift_s_radio_state *radio = rift_s_system_radio(ctrl->sys);
+	timepoint_ns now = os_monotonic_get_ns();
 
 	if (ctrl->device_id != device_id) {
 		ctrl->device_id = device_id;
 		snprintf(ctrl->base.serial, XRT_DEVICE_NAME_LEN, "%016" PRIx64, device_id);
 		// If the device ID changed somehow, re-read the JSON blocks
 		ctrl->have_config = ctrl->have_calibration = false;
+		ctrl->reading_config = ctrl->reading_calibration = false;
+		ctrl->last_config_attempt_ns = 0;
+		ctrl->last_calibration_attempt_ns = 0;
 	}
 
 	if (!ctrl->have_config && !ctrl->reading_config) {
-		const uint8_t config_req[] = {0x32, 0x20, 0xe8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-		rift_s_radio_queue_command(radio, ctrl->device_id, config_req, sizeof(config_req),
-		                           (rift_s_radio_completion_fn)ctrl_config_cb, ctrl);
-		ctrl->reading_config = true;
+		if (ctrl->last_config_attempt_ns == 0 ||
+		    (now - ctrl->last_config_attempt_ns) >= RIFT_S_CONFIG_RETRY_INTERVAL_NS) {
+			const uint8_t config_req[] = {0x32, 0x20, 0xe8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+			ctrl->last_config_attempt_ns = now;
+			ctrl->reading_config = true;
+			rift_s_radio_queue_command(radio, ctrl->device_id, config_req, sizeof(config_req),
+			                           (rift_s_radio_completion_fn)ctrl_config_cb, ctrl);
+		}
 	}
 
 	if (!ctrl->have_calibration && !ctrl->reading_calibration) {
-		rift_s_radio_get_json_block(radio, ctrl->device_id, (rift_s_radio_completion_fn)ctrl_json_cb, ctrl);
-		ctrl->reading_calibration = true;
+		if (ctrl->last_calibration_attempt_ns == 0 ||
+		    (now - ctrl->last_calibration_attempt_ns) >= RIFT_S_CONFIG_RETRY_INTERVAL_NS) {
+			ctrl->last_calibration_attempt_ns = now;
+			ctrl->reading_calibration = true;
+			rift_s_radio_get_json_block(radio, ctrl->device_id, (rift_s_radio_completion_fn)ctrl_json_cb, ctrl);
+		}
 	}
 }
