@@ -298,10 +298,10 @@ rift_s_create_hand_tracker(struct rift_s_tracker *t,
 static void
 rift_s_fill_constellation_calibration(struct rift_s_tracker *t, struct rift_s_hmd_config *hmd_config)
 {
-/* Rift S thresholds for min brightness and min-blob-required magnitude. Quite high thresholds,
- * due to bright LED pulses and a lot of light bleed */
-#define BLOB_PIXEL_THRESHOLD 0x60
-#define BLOB_THRESHOLD_MIN 0x80
+/* Rift S thresholds for min brightness and min-blob-required magnitude. Tuned to allow
+ * detection at arm's length / waist level without picking up diffuse room bleed */
+#define BLOB_PIXEL_THRESHOLD 0x40
+#define BLOB_THRESHOLD_MIN 0x58
 
 	struct rift_s_camera_calibration_block *camera_calibration = &hmd_config->camera_calibration;
 	struct t_constellation_camera_group *out = &t->constellation_calib;

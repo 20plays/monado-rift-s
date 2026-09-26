@@ -751,8 +751,8 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 			time_duration_ns dt_ns = (uint64_t)xf->timestamp - device->last_seen_pose_ts;
 			float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
 			pos_error = MIN_POS_ERROR + 2.0f * dt;
-			if (pos_error > 0.35f) {
-				pos_error = 0.35f;
+			if (pos_error > 1.20f) {
+				pos_error = 1.20f;
 			}
 		}
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
@@ -913,12 +913,15 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 				enum correspondence_search_flags search_flags =
 				    CS_FLAG_STOP_FOR_STRONG_MATCH | CS_FLAG_HAVE_POSE_PRIOR | CS_FLAG_MATCH_GRAVITY;
 
+				struct xrt_vec3 *pos_error_thresh = &dev_state->prior_pos_error;
+				struct xrt_vec3 deep_pos_error = {1.5f, 1.5f, 1.5f};
 				if (pass == 0) {
-					/* 1st pass - quick search only */
+					/* 1st pass - quick search near prior */
 					search_flags |= CS_FLAG_SHALLOW_SEARCH;
 				} else {
-					/* 2nd pass - do a deep search */
+					/* 2nd pass - deep recovery search with wide arm-reach bounds */
 					search_flags |= CS_FLAG_DEEP_SEARCH;
+					pos_error_thresh = &deep_pos_error;
 				}
 
 				struct xrt_pose P_cam_obj;
@@ -926,7 +929,7 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 
 				if (correspondence_search_find_one_pose(
 				        cam->cs, device->search_led_model, search_flags, &P_cam_obj,
-				        &dev_state->prior_pos_error, &dev_state->prior_rot_error,
+				        pos_error_thresh, &dev_state->prior_rot_error,
 				        &view->cam_gravity_vector, dev_state->gravity_error_rad, &dev_state->score)) {
 					CT_DEBUG(ct, "Found a pose on cam %u device %d long search pass %d", view_id,
 					         device->led_model.id, pass);
