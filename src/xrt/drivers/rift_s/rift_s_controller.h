@@ -57,6 +57,9 @@ struct rift_s_controller
 	timepoint_ns last_tracked_pose_ts;
 	//! Last tracked pose from optical controller tracking
 	struct xrt_pose last_tracked_pose;
+	//! Filtered linear velocity from optical observations
+	struct xrt_vec3 linear_velocity;
+	bool have_linear_velocity;
 	//! debug boolean - enable yaw updates
 	bool update_yaw_from_optical;
 

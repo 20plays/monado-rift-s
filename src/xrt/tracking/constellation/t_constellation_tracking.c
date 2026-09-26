@@ -745,9 +745,18 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		// Incoming controller pose is in OpenXR. Flip it to OpenCV for all our operations
 		pose_flip_YZ(&P_xrworld_model, &dev_state->P_world_obj_prior);
 
-		//! @todo: Get actual error bounds from fusion
+		//! Expand prior position error bounds with elapsed time to prevent fast match drops
+		float pos_error = MIN_POS_ERROR;
+		if (device->have_last_seen_pose && (uint64_t)xf->timestamp > device->last_seen_pose_ts) {
+			time_duration_ns dt_ns = (uint64_t)xf->timestamp - device->last_seen_pose_ts;
+			float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
+			pos_error = MIN_POS_ERROR + 2.0f * dt;
+			if (pos_error > 0.35f) {
+				pos_error = 0.35f;
+			}
+		}
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
-		    MIN_POS_ERROR;
+		    pos_error;
 		dev_state->prior_rot_error.x = dev_state->prior_rot_error.y = dev_state->prior_rot_error.z =
 		    MIN_ROT_ERROR;
 		dev_state->gravity_error_rad = MIN_ROT_ERROR;

@@ -586,6 +586,25 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 		rel->pose.position = ctrl->last_tracked_pose.position;
 		rel->relation_flags |= (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
 		                                                       XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+
+		if (ctrl->have_linear_velocity) {
+			rel->linear_velocity = ctrl->linear_velocity;
+			rel->relation_flags |=
+			    (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
+
+			// Extrapolate position between 30 Hz optical frames
+			if (at_timestamp_ns > ctrl->last_tracked_pose_ts) {
+				time_duration_ns dt_ns = at_timestamp_ns - ctrl->last_tracked_pose_ts;
+				// Cap extrapolation at 50ms (1.5 camera frames) to prevent overshoot
+				if (dt_ns > 50 * U_TIME_1MS_IN_NS) {
+					dt_ns = 50 * U_TIME_1MS_IN_NS;
+				}
+				float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
+				rel->pose.position.x += ctrl->linear_velocity.x * dt;
+				rel->pose.position.y += ctrl->linear_velocity.y * dt;
+				rel->pose.position.z += ctrl->linear_velocity.z * dt;
+			}
+		}
 	}
 	os_mutex_unlock(&ctrl->mutex);
 
@@ -669,8 +688,40 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
 	os_mutex_lock(&ctrl->mutex);
 
+	timepoint_ns prev_ts = ctrl->last_tracked_pose_ts;
+	struct xrt_pose prev_pose = ctrl->last_tracked_pose;
+
 	ctrl->last_tracked_pose_ts = frame_mono_ns;
 	ctrl->last_tracked_pose = *pose;
+
+	if (prev_ts != 0 && frame_mono_ns > prev_ts) {
+		time_duration_ns dt_ns = frame_mono_ns - prev_ts;
+		// Normal inter-frame interval for ~30 FPS camera is ~33ms (allow 15ms to 150ms)
+		if (dt_ns >= 15 * U_TIME_1MS_IN_NS && dt_ns <= 150 * U_TIME_1MS_IN_NS) {
+			float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
+			struct xrt_vec3 inst_vel = {
+			    .x = (pose->position.x - prev_pose.position.x) / dt,
+			    .y = (pose->position.y - prev_pose.position.y) / dt,
+			    .z = (pose->position.z - prev_pose.position.z) / dt,
+			};
+			if (ctrl->have_linear_velocity) {
+				const float alpha = 0.6f;
+				ctrl->linear_velocity.x =
+				    alpha * inst_vel.x + (1.0f - alpha) * ctrl->linear_velocity.x;
+				ctrl->linear_velocity.y =
+				    alpha * inst_vel.y + (1.0f - alpha) * ctrl->linear_velocity.y;
+				ctrl->linear_velocity.z =
+				    alpha * inst_vel.z + (1.0f - alpha) * ctrl->linear_velocity.z;
+			} else {
+				ctrl->linear_velocity = inst_vel;
+				ctrl->have_linear_velocity = true;
+			}
+		} else if (dt_ns > 150 * U_TIME_1MS_IN_NS) {
+			// After tracking loss / freeze, reset velocity so the recovery teleport doesn't cause a spike
+			ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
+			ctrl->have_linear_velocity = false;
+		}
+	}
 
 	if (ctrl->update_yaw_from_optical) {
 		// Apply 5% of observed orientation yaw to 3dof fusion
