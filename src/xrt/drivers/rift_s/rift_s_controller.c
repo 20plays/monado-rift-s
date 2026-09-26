@@ -692,7 +692,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	// Run optical position observation through One-Euro filter to remove 30 Hz camera sensor discretization noise
 	struct xrt_vec3 filtered_pos;
 	if (!ctrl->pos_filter_initialized) {
-		m_filter_euro_vec3_init(&ctrl->pos_filter, 1.2, 1.0, 0.03);
+		m_filter_euro_vec3_init(&ctrl->pos_filter, 6.0, 1.0, 0.1);
 		ctrl->pos_filter_initialized = true;
 	}
 	m_filter_euro_vec3_run(&ctrl->pos_filter, (uint64_t)frame_mono_ns, &pose->position, &filtered_pos);
