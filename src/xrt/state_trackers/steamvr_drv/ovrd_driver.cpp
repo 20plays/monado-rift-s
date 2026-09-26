@@ -403,11 +403,31 @@ public:
 			}
 			break;
 		case XRT_DEVICE_TOUCH_CONTROLLER:
-			if (hand == XRT_HAND_LEFT) {
-				m_render_model = "oculus_cv1_controller_left";
-			}
-			if (hand == XRT_HAND_RIGHT) {
-				m_render_model = "oculus_cv1_controller_right";
+		case XRT_DEVICE_TOUCH_CONTROLLER_RIFT_CV1:
+		case XRT_DEVICE_TOUCH_CONTROLLER_QUEST_1_RIFT_S:
+		case XRT_DEVICE_TOUCH_CONTROLLER_QUEST_2:
+			if ((strstr(m_xdev->str, "Rift S") != NULL) ||
+			    (m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_QUEST_1_RIFT_S)) {
+				if (hand == XRT_HAND_LEFT) {
+					m_render_model = "oculus_rifts_controller_left";
+				}
+				if (hand == XRT_HAND_RIGHT) {
+					m_render_model = "oculus_rifts_controller_right";
+				}
+			} else if (m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_QUEST_2) {
+				if (hand == XRT_HAND_LEFT) {
+					m_render_model = "oculus_quest2_controller_left";
+				}
+				if (hand == XRT_HAND_RIGHT) {
+					m_render_model = "oculus_quest2_controller_right";
+				}
+			} else {
+				if (hand == XRT_HAND_LEFT) {
+					m_render_model = "oculus_cv1_controller_left";
+				}
+				if (hand == XRT_HAND_RIGHT) {
+					m_render_model = "oculus_cv1_controller_right";
+				}
 			}
 			break;
 		case XRT_DEVICE_VIVE_WAND: m_render_model = "vr_controller_vive_1_5"; break;
@@ -902,6 +922,9 @@ public:
 		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_InputProfilePath_String, m_input_profile.c_str());
 		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_RenderModelName_String, m_render_model);
 		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ModelNumber_String, m_xdev->str);
+		if (m_controller_type != NULL) {
+			vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ControllerType_String, m_controller_type);
+		}
 
 		// clang-format on
 
@@ -980,8 +1003,11 @@ public:
 			grip_name = XRT_INPUT_DAYDREAM_POSE;
 		} else if (m_xdev->name == XRT_DEVICE_HYDRA) {
 			grip_name = XRT_INPUT_HYDRA_GRIP_POSE;
-		} else if (m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER) {
-			grip_name = XRT_INPUT_TOUCH_GRIP_POSE;
+		} else if (m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER ||
+		           m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_RIFT_CV1 ||
+		           m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_QUEST_1_RIFT_S ||
+		           m_xdev->name == XRT_DEVICE_TOUCH_CONTROLLER_QUEST_2) {
+			grip_name = XRT_INPUT_TOUCH_AIM_POSE;
 		} else if (m_xdev->name == XRT_DEVICE_WMR_CONTROLLER) {
 			grip_name = XRT_INPUT_WMR_GRIP_POSE;
 		} else if (m_xdev->name == XRT_DEVICE_SAMSUNG_ODYSSEY_CONTROLLER) {

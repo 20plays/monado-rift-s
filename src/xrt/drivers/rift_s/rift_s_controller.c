@@ -31,6 +31,7 @@
 #include "util/u_time.h"
 #include "util/u_trace_marker.h"
 #include "util/u_var.h"
+#include "util/u_debug.h"
 
 #include "rift_s.h"
 #include "rift_s_hmd.h"
@@ -40,6 +41,8 @@
 
 /* Set to 1 to print controller states continuously */
 #define DUMP_CONTROLLER_STATE 0
+
+DEBUG_GET_ONCE_BOOL_OPTION(flip_left_yaw, "RIFT_S_FLIP_LEFT_YAW", false)
 
 static struct xrt_binding_input_pair simple_inputs_rift_s[4] = {
     {XRT_INPUT_SIMPLE_SELECT_CLICK, XRT_INPUT_TOUCH_TRIGGER_VALUE},
@@ -571,6 +574,13 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 	struct xrt_relation_chain xrc = {0};
 
 	os_mutex_lock(&ctrl->mutex);
+	if (ctrl->flip_left_yaw) {
+		struct xrt_pose flip = {
+		    .orientation = {.x = 0.0f, .y = 1.0f, .z = 0.0f, .w = 0.0f},
+		    .position = {0.0f, 0.0f, 0.0f},
+		};
+		m_relation_chain_push_pose(&xrc, &flip);
+	}
 	if (name == XRT_INPUT_TOUCH_AIM_POSE) {
 		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
 	} else if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
@@ -804,11 +814,6 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 
 	os_mutex_init(&ctrl->mutex);
 
-	/* Default grip pose up by 40° degrees around the X axis and 3.5cm down handle in Z */
-	struct xrt_vec3 translation = {0.0f, -0.015f, 0.035f};
-	struct xrt_vec3 axis = {1.0, 0, 0};
-	math_quat_from_angle_vector(DEG_TO_RAD(40), &axis, &ctrl->P_aim_grip.orientation);
-	ctrl->P_aim_grip.position = translation;
 	ctrl->pos_filter_initialized = false;
 
 	u_device_populate_function_pointers(&ctrl->base, rift_s_controller_get_tracked_pose, rift_s_controller_destroy);
@@ -820,11 +825,19 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 	ctrl->base.supported.orientation_tracking = true;
 	ctrl->base.supported.position_tracking = true;
 
-
+	struct xrt_vec3 axis = {1.0f, 0.0f, 0.0f};
 	if (device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
 		ctrl->device_type = RIFT_S_DEVICE_LEFT_CONTROLLER;
+		ctrl->flip_left_yaw = debug_get_bool_option_flip_left_yaw();
+		struct xrt_vec3 translation = {0.007f, -0.0018f, 0.102f};
+		math_quat_from_angle_vector(DEG_TO_RAD(20.6f), &axis, &ctrl->P_aim_grip.orientation);
+		ctrl->P_aim_grip.position = translation;
 	} else {
 		ctrl->device_type = RIFT_S_DEVICE_RIGHT_CONTROLLER;
+		ctrl->flip_left_yaw = false;
+		struct xrt_vec3 translation = {-0.007f, -0.0018f, 0.102f};
+		math_quat_from_angle_vector(DEG_TO_RAD(20.6f), &axis, &ctrl->P_aim_grip.orientation);
+		ctrl->P_aim_grip.position = translation;
 	}
 
 	ctrl->pose.orientation.w = 1.0f; // All other values set to zero by U_DEVICE_ALLOCATE (which calls U_CALLOC)
@@ -872,6 +885,9 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 	u_var_add_pose(ctrl, &ctrl->pose, "Tracked Pose");
 
 	u_var_add_pose(ctrl, &ctrl->P_aim_grip, "Grip pose offset");
+	if (device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
+		u_var_add_bool(ctrl, &ctrl->flip_left_yaw, "Flip Left Yaw (180 deg)");
+	}
 
 	u_var_add_gui_header(ctrl, NULL, "3DoF Tracking");
 	m_imu_3dof_add_vars(&ctrl->fusion, ctrl, "");

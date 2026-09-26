@@ -98,6 +98,9 @@ struct rift_s_controller
 	//! Offset for grip pose
 	struct xrt_pose P_aim_grip;
 
+	//! Flip left controller yaw by 180 degrees (for in-game orientation correction)
+	bool flip_left_yaw;
+
 	/* Controls / buttons state */
 	timepoint_ns last_controls_local_time_ns;
 
