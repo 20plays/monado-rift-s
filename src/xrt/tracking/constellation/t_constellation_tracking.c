@@ -913,21 +913,12 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 				enum correspondence_search_flags search_flags =
 				    CS_FLAG_STOP_FOR_STRONG_MATCH | CS_FLAG_HAVE_POSE_PRIOR | CS_FLAG_MATCH_GRAVITY;
 
-				/* Widen only the deep recovery pass: after a loss during
-				 * motion the hand is far outside the 0.35 m prior box,
-				 * so a lost device can never reacquire until it wanders
-				 * back. The match score gate still rejects false fits,
-				 * and downstream (continuity/teleport/yaw gates) fences
-				 * any wrong recovery that slips through. */
-				struct xrt_vec3 *pos_error_thresh = &dev_state->prior_pos_error;
-				struct xrt_vec3 deep_pos_error = {1.5f, 1.5f, 1.5f};
 				if (pass == 0) {
 					/* 1st pass - quick search only */
 					search_flags |= CS_FLAG_SHALLOW_SEARCH;
 				} else {
 					/* 2nd pass - do a deep search */
 					search_flags |= CS_FLAG_DEEP_SEARCH;
-					pos_error_thresh = &deep_pos_error;
 				}
 
 				struct xrt_pose P_cam_obj;
@@ -935,7 +926,7 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 
 				if (correspondence_search_find_one_pose(
 				        cam->cs, device->search_led_model, search_flags, &P_cam_obj,
-				        pos_error_thresh, &dev_state->prior_rot_error,
+				        &dev_state->prior_pos_error, &dev_state->prior_rot_error,
 				        &view->cam_gravity_vector, dev_state->gravity_error_rad, &dev_state->score)) {
 					CT_DEBUG(ct, "Found a pose on cam %u device %d long search pass %d", view_id,
 					         device->led_model.id, pass);
