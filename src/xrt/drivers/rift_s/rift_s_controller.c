@@ -209,6 +209,62 @@ handle_imu_update(struct rift_s_controller *ctrl,
 	m_imu_3dof_update(&ctrl->fusion, ctrl->last_imu_device_time_ns, &ctrl->accel, &ctrl->gyro);
 	ctrl->pose.orientation = ctrl->fusion.rot;
 
+	/* High-rate position dead reckoning between 30 Hz optical frames.
+	 *
+	 * Convert the calibrated specific force to world-frame linear
+	 * acceleration (at rest the accelerometer reports +9.81 m/s^2 along
+	 * world +Y, see m_imu_3dof gravity levelling), then integrate it into
+	 * the predicted position/velocity. Short-term (<100 ms) IMU drift is
+	 * sub-millimetre, so this bridges optical frames smoothly at any query
+	 * rate; the optical path below re-anchors it with small corrections. */
+	if (dt > 0 && dt < 50000) {
+		struct xrt_vec3 a_world;
+		math_quat_rotate_vec3(&ctrl->fusion.rot, &ctrl->accel, &a_world);
+		a_world.y -= (float)MATH_GRAVITY_M_S2;
+
+		/* Track slow accel bias while stationary (still gyro + slow
+		 * optical motion). At ~1 kHz sample rate this gain gives a time
+		 * constant of about half a second. */
+		float gyro_speed = m_vec3_len(ctrl->gyro);
+		float opt_speed = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
+		if (gyro_speed < 0.15f && opt_speed < 0.05f) {
+			const float bk = 0.002f;
+			ctrl->accel_bias.x += bk * (a_world.x - ctrl->accel_bias.x);
+			ctrl->accel_bias.y += bk * (a_world.y - ctrl->accel_bias.y);
+			ctrl->accel_bias.z += bk * (a_world.z - ctrl->accel_bias.z);
+			/* Never let a runaway bias build up while "stationary". */
+			float blen = m_vec3_len(ctrl->accel_bias);
+			if (blen > 1.0f) {
+				float s = 1.0f / blen;
+				ctrl->accel_bias.x *= s;
+				ctrl->accel_bias.y *= s;
+				ctrl->accel_bias.z *= s;
+			}
+		}
+
+		struct xrt_vec3 a_corr = m_vec3_sub(a_world, ctrl->accel_bias);
+		ctrl->pred_accel = a_corr;
+
+		if (ctrl->have_pred) {
+			float step = (float)dt * 1e-6f; // device dt is microseconds
+			ctrl->pred_velocity.x += a_corr.x * step;
+			ctrl->pred_velocity.y += a_corr.y * step;
+			ctrl->pred_velocity.z += a_corr.z * step;
+			/* Safety clamp: hands never sustain more than this. */
+			float vspeed = m_vec3_len(ctrl->pred_velocity);
+			if (vspeed > 8.0f) {
+				float s = 8.0f / vspeed;
+				ctrl->pred_velocity.x *= s;
+				ctrl->pred_velocity.y *= s;
+				ctrl->pred_velocity.z *= s;
+			}
+			ctrl->pred_position.x += ctrl->pred_velocity.x * step;
+			ctrl->pred_position.y += ctrl->pred_velocity.y * step;
+			ctrl->pred_position.z += ctrl->pred_velocity.z * step;
+			ctrl->pred_ts_mono = local_ts;
+		}
+	}
+
 #if 0
 	RIFT_S_DEBUG("%" PRIx64 " dt %u device time %u ns %" PRIu64
 	             " raw accel %d %d %d gyro %d %d %d -> accel %f %f %f  gyro %f %f %f\n",
@@ -595,24 +651,30 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 		rel->relation_flags |= (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
 		                                                       XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
 
+		if (ctrl->have_pred) {
+			/* Predict the IMU-propagated position forward to the query
+			 * time with constant acceleration. Between optical frames
+			 * this is millimetre-accurate; shortly after tracking loss
+			 * it coasts smoothly instead of freezing the hand. */
+			time_duration_ns dt_ns = at_timestamp_ns - ctrl->pred_ts_mono;
+			if (dt_ns < 0) {
+				dt_ns = 0;
+			} else if (dt_ns > 120 * U_TIME_1MS_IN_NS) {
+				dt_ns = 120 * U_TIME_1MS_IN_NS;
+			}
+			float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
+			rel->pose.position.x =
+			    ctrl->pred_position.x + ctrl->pred_velocity.x * dt + 0.5f * ctrl->pred_accel.x * dt * dt;
+			rel->pose.position.y =
+			    ctrl->pred_position.y + ctrl->pred_velocity.y * dt + 0.5f * ctrl->pred_accel.y * dt * dt;
+			rel->pose.position.z =
+			    ctrl->pred_position.z + ctrl->pred_velocity.z * dt + 0.5f * ctrl->pred_accel.z * dt * dt;
+		}
+
 		if (ctrl->have_linear_velocity) {
 			rel->linear_velocity = ctrl->linear_velocity;
 			rel->relation_flags |=
 			    (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
-
-			// Extrapolate position between 30 Hz optical frames only if moving (deadband 0.04 m/s)
-			float speed = m_vec3_len(ctrl->linear_velocity);
-			if (speed > 0.04f && at_timestamp_ns > ctrl->last_tracked_pose_ts) {
-				time_duration_ns dt_ns = at_timestamp_ns - ctrl->last_tracked_pose_ts;
-				// Cap extrapolation at 35ms (~1 frame) to prevent overshoot
-				if (dt_ns > 35 * U_TIME_1MS_IN_NS) {
-					dt_ns = 35 * U_TIME_1MS_IN_NS;
-				}
-				float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
-				rel->pose.position.x += ctrl->linear_velocity.x * dt;
-				rel->pose.position.y += ctrl->linear_velocity.y * dt;
-				rel->pose.position.z += ctrl->linear_velocity.z * dt;
-			}
 		}
 	}
 	os_mutex_unlock(&ctrl->mutex);
@@ -697,6 +759,59 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
 	os_mutex_lock(&ctrl->mutex);
 
+	timepoint_ns prev_ts = ctrl->last_tracked_pose_ts;
+	struct xrt_pose prev_pose = ctrl->last_tracked_pose;
+
+	/* Innovation gate (on the RAW observation, so rejected outliers never
+	 * touch the smoothing filter): compare the new optical position against
+	 * where the IMU dead reckoning thinks the hand is. Back-propagate the
+	 * prediction to the frame capture time with our own (smooth) model, so
+	 * the residual is accurate to millimetres plus optical noise. A large
+	 * residual means a bad PnP solve (partial occlusion, motion blur, wrong
+	 * blobs), not fast motion, so reject it instead of yanking the hand.
+	 * The gate grows with staleness * speed because a fast hand legitimately
+	 * travels far between capture and arrival. After many consecutive
+	 * rejects we assume the predictor (not the camera) is lost and re-accept.
+	 *
+	 * Back-propagated prediction at capture time, reused below for the
+	 * correction so motion since capture is kept. */
+	bool accept = true;
+	float pos_gain = 0.3f;
+	float vel_gain = 0.1f;
+	struct xrt_vec3 back = {0, 0, 0};
+	bool have_back = false;
+	if (ctrl->have_pred && prev_ts != 0 && frame_mono_ns > prev_ts) {
+		time_duration_ns gap_ns = frame_mono_ns - prev_ts;
+		if (gap_ns <= 150 * U_TIME_1MS_IN_NS) {
+			timepoint_ns now_mono_ns = os_monotonic_get_ns();
+			float stale_s = (float)(now_mono_ns - frame_mono_ns) / (float)U_TIME_1S_IN_NS;
+			if (stale_s < 0.0f) {
+				stale_s = 0.0f;
+			}
+			float back_dt = stale_s;
+			if (back_dt > 0.25f) {
+				back_dt = 0.25f;
+			}
+			back.x = ctrl->pred_position.x - ctrl->pred_velocity.x * back_dt;
+			back.y = ctrl->pred_position.y - ctrl->pred_velocity.y * back_dt;
+			back.z = ctrl->pred_position.z - ctrl->pred_velocity.z * back_dt;
+			have_back = true;
+			struct xrt_vec3 raw_innov = m_vec3_sub(pose->position, back);
+			float innov_dist = m_vec3_len(raw_innov);
+			float speed = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
+			float gate = 0.09f + 2.0f * speed * stale_s;
+			if (innov_dist > gate && ctrl->optical_reject_count < 10) {
+				accept = false;
+				ctrl->optical_reject_count++;
+			}
+		}
+	}
+	if (!accept) {
+		os_mutex_unlock(&ctrl->mutex);
+		return;
+	}
+	ctrl->optical_reject_count = 0;
+
 	// Run optical position observation through One-Euro filter to remove 30 Hz camera sensor discretization noise
 	struct xrt_vec3 filtered_pos;
 	if (!ctrl->pos_filter_initialized) {
@@ -705,12 +820,26 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	}
 	m_filter_euro_vec3_run(&ctrl->pos_filter, (uint64_t)frame_mono_ns, &pose->position, &filtered_pos);
 
-	timepoint_ns prev_ts = ctrl->last_tracked_pose_ts;
-	struct xrt_pose prev_pose = ctrl->last_tracked_pose;
+	/* Residual of the accepted (filtered) observation vs the prediction at
+	 * capture time. */
+	struct xrt_vec3 residual = {0, 0, 0};
+	if (have_back) {
+		residual = m_vec3_sub(filtered_pos, back);
+	}
 
 	ctrl->last_tracked_pose_ts = frame_mono_ns;
 	ctrl->last_tracked_pose.position = filtered_pos;
 	ctrl->last_tracked_pose.orientation = pose->orientation;
+
+	/* Re-anchor the IMU predictor with a complementary correction.
+	 * The predictor already tracked the motion since capture, so only the
+	 * back-propagated residual (optical noise + IMU drift) is applied - a
+	 * snap to the capture-time value would erase real motion and cause a
+	 * 30 Hz sawtooth. After a tracking gap the predictor has drifted, so
+	 * the full residual is applied instead. pred_ts_mono always stays at
+	 * the last consumed IMU sample; it is never moved backwards. */
+	bool snap = false;
+	bool reseed = false;
 
 	if (prev_ts != 0 && frame_mono_ns > prev_ts) {
 		time_duration_ns dt_ns = frame_mono_ns - prev_ts;
@@ -723,6 +852,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
 				ctrl->have_linear_velocity = false;
 				ctrl->pos_filter_initialized = false;
+				snap = true;
 			} else {
 				float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
 				struct xrt_vec3 inst_vel = {
@@ -756,6 +886,44 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
 			ctrl->have_linear_velocity = false;
 			ctrl->pos_filter_initialized = false;
+			snap = true;
+			reseed = true;
+		}
+	} else {
+		// First ever optical frame: seed the predictor exactly.
+		snap = true;
+		reseed = true;
+	}
+
+	if (!ctrl->have_pred || reseed) {
+		/* (Re)seed: the predictor has nothing useful (startup, or it
+		 * coasted IMU-only through an occlusion), so anchor it to the
+		 * optical value. A small pop here is expected and correct. */
+		ctrl->pred_position = filtered_pos;
+		ctrl->pred_velocity = ctrl->have_linear_velocity ? ctrl->linear_velocity
+		                                                 : (struct xrt_vec3){0, 0, 0};
+		ctrl->pred_ts_mono = frame_mono_ns;
+		ctrl->have_pred = true;
+	} else {
+		/* Complementary correction: shift the live prediction by the
+		 * residual (full shift after a gap/teleport, small gain otherwise)
+		 * and bleed the optical velocity in slowly. Fast transients
+		 * (swings, reversals) are carried by the IMU, so small gains keep
+		 * motion crisp while killing drift. */
+		float k = snap ? 1.0f : pos_gain;
+		ctrl->pred_position.x += k * residual.x;
+		ctrl->pred_position.y += k * residual.y;
+		ctrl->pred_position.z += k * residual.z;
+		if (snap) {
+			ctrl->pred_velocity = ctrl->have_linear_velocity ? ctrl->linear_velocity
+			                                                 : (struct xrt_vec3){0, 0, 0};
+		} else if (ctrl->have_linear_velocity) {
+			ctrl->pred_velocity.x +=
+			    vel_gain * (ctrl->linear_velocity.x - ctrl->pred_velocity.x);
+			ctrl->pred_velocity.y +=
+			    vel_gain * (ctrl->linear_velocity.y - ctrl->pred_velocity.y);
+			ctrl->pred_velocity.z +=
+			    vel_gain * (ctrl->linear_velocity.z - ctrl->pred_velocity.z);
 		}
 	}
 
@@ -773,24 +941,48 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			struct xrt_quat q_err;
 			math_quat_rotate(&pose->orientation, &fusion_inv, &q_err);
 
-			// In OpenXR world space, +Y is UP (gravity axis).
-			// Extract pure rotation around World Y:
-			struct xrt_quat q_yaw = {
-			    .x = 0.0f,
-			    .y = q_err.y,
-			    .z = 0.0f,
-			    .w = q_err.w,
-			};
-			math_quat_normalize(&q_yaw);
+			/* Gate the correction: gyro yaw drift accumulates at
+			 * degrees-per-minute, so a large disagreement means the
+			 * optical solve is wrong (bad correspondences, partial
+			 * occlusion), not that the gyro drifted. Dragging the
+			 * fusion toward a bad solve is what visibly rotates the
+			 * hands wrong while they are held still in menus. */
+			float w = q_err.w;
+			if (w > 1.0f) {
+				w = 1.0f;
+			} else if (w < -1.0f) {
+				w = -1.0f;
+			}
+			float total_err_rad = 2.0f * acosf(fabsf(w));
+			float yw_len_sq = q_err.y * q_err.y + q_err.w * q_err.w;
+			if (total_err_rad < DEG_TO_RAD(30.0f) && yw_len_sq > 1e-12f) {
+				// In OpenXR world space, +Y is UP (gravity axis).
+				// Extract pure rotation around World Y:
+				struct xrt_quat q_yaw = {
+				    .x = 0.0f,
+				    .y = q_err.y,
+				    .z = 0.0f,
+				    .w = q_err.w,
+				};
+				math_quat_normalize(&q_yaw);
+				float yaw_w = q_yaw.w;
+				if (yaw_w > 1.0f) {
+					yaw_w = 1.0f;
+				} else if (yaw_w < -1.0f) {
+					yaw_w = -1.0f;
+				}
+				float yaw_err_rad = 2.0f * acosf(fabsf(yaw_w));
+				if (yaw_err_rad < DEG_TO_RAD(25.0f)) {
+					// Apply a gentle complementary filter nudge (2% per 33 ms frame)
+					struct xrt_quat correction;
+					const struct xrt_quat id = XRT_QUAT_IDENTITY;
+					math_quat_slerp(&id, &q_yaw, 0.02f, &correction);
 
-			// Apply a gentle complementary filter nudge (2% per 33 ms frame)
-			struct xrt_quat correction;
-			const struct xrt_quat id = XRT_QUAT_IDENTITY;
-			math_quat_slerp(&id, &q_yaw, 0.02f, &correction);
-
-			// Apply correction on the left (in world space):
-			// q_fusion_new = correction * q_fusion
-			math_quat_rotate(&correction, &ctrl->fusion.rot, &ctrl->fusion.rot);
+					// Apply correction on the left (in world space):
+					// q_fusion_new = correction * q_fusion
+					math_quat_rotate(&correction, &ctrl->fusion.rot, &ctrl->fusion.rot);
+				}
+			}
 		}
 	}
 	// Update pose position for the debug UI

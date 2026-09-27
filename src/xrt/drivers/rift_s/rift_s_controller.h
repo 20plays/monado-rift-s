@@ -67,6 +67,25 @@ struct rift_s_controller
 	//! debug boolean - enable yaw updates
 	bool update_yaw_from_optical;
 
+	/* High-rate IMU-aided position state.
+	 *
+	 * The constellation tracker only produces optical positions at ~30 Hz,
+	 * so holding the last optical sample (plus a short linear extrapolation)
+	 * makes the hands step and freeze. Instead we dead-reckon position at IMU
+	 * rate: world-frame linear acceleration (gravity removed, bias corrected)
+	 * is integrated into pred_position/pred_velocity, and each accepted
+	 * optical frame only applies a small complementary correction. Over the
+	 * <=33 ms between optical frames the IMU drift is sub-millimetre, so the
+	 * reported pose is smooth at any query rate while staying anchored. */
+	struct xrt_vec3 pred_position;
+	struct xrt_vec3 pred_velocity;
+	struct xrt_vec3 pred_accel;
+	struct xrt_vec3 accel_bias;
+	timepoint_ns pred_ts_mono;
+	bool have_pred;
+	//! Consecutive optical frames rejected by the innovation gate
+	uint32_t optical_reject_count;
+
 	/* Debug logs */
 	/* 0x04 = new log line
 	 * 0x02 = parity bit, toggles each line when receiving log chars
