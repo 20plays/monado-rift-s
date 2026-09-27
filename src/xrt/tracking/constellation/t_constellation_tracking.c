@@ -913,12 +913,61 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 				enum correspondence_search_flags search_flags =
 				    CS_FLAG_STOP_FOR_STRONG_MATCH | CS_FLAG_HAVE_POSE_PRIOR | CS_FLAG_MATCH_GRAVITY;
 
+				/* Sibling-aware recovery box for the deep pass: a hand
+				 * lost during motion sits far outside the 0.35 m prior
+				 * box and can never reacquire (the left hand starved at
+				 * 3-11 Hz solves this way). Widen the box, but never to
+				 * within 0.45 m of a sibling's fresh pose: with identical
+				 * LED geometry on both hands, an over-wide box fits the
+				 * sibling's blobs, scores them GOOD, and mislabels them,
+				 * parking both hands. When the sibling is close, stale,
+				 * or unknown the bound stays exactly as before. */
+				struct xrt_vec3 *pos_error_thresh = &dev_state->prior_pos_error;
+				struct xrt_vec3 deep_pos_error = {0.35f, 0.35f, 0.35f};
 				if (pass == 0) {
 					/* 1st pass - quick search only */
 					search_flags |= CS_FLAG_SHALLOW_SEARCH;
 				} else {
 					/* 2nd pass - do a deep search */
 					search_flags |= CS_FLAG_DEEP_SEARCH;
+					float half = 1.5f;
+					os_mutex_lock(&ct->tracked_device_lock);
+					for (int o = 0; o < ct->num_devices; o++) {
+						if (o == dev_state->dev_index) {
+							continue;
+						}
+						struct constellation_tracker_device *other = ct->devices + o;
+						if (!other->have_last_seen_pose) {
+							continue;
+						}
+						if (sample->timestamp <= other->last_seen_pose_ts) {
+							continue;
+						}
+						uint64_t age_ns = sample->timestamp - other->last_seen_pose_ts;
+						if (age_ns > 500 * U_TIME_1MS_IN_NS) {
+							continue;
+						}
+						float dx = other->last_seen_pose.position.x -
+						    dev_state->P_world_obj_prior.position.x;
+						float dy = other->last_seen_pose.position.y -
+						    dev_state->P_world_obj_prior.position.y;
+						float dz = other->last_seen_pose.position.z -
+						    dev_state->P_world_obj_prior.position.z;
+						float h = sqrtf(dx * dx + dy * dy + dz * dz) - 0.45f;
+						if (h < half) {
+							half = h;
+						}
+					}
+					os_mutex_unlock(&ct->tracked_device_lock);
+					if (half < 0.35f) {
+						half = 0.35f;
+					}
+					if (half > 0.36f) {
+						CT_DEBUG(ct, "Deep search for device %d using widened box %.2f m",
+						         device->led_model.id, half);
+					}
+					deep_pos_error.x = deep_pos_error.y = deep_pos_error.z = half;
+					pos_error_thresh = &deep_pos_error;
 				}
 
 				struct xrt_pose P_cam_obj;
@@ -926,7 +975,7 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
 
 				if (correspondence_search_find_one_pose(
 				        cam->cs, device->search_led_model, search_flags, &P_cam_obj,
-				        &dev_state->prior_pos_error, &dev_state->prior_rot_error,
+				        pos_error_thresh, &dev_state->prior_rot_error,
 				        &view->cam_gravity_vector, dev_state->gravity_error_rad, &dev_state->score)) {
 					CT_DEBUG(ct, "Found a pose on cam %u device %d long search pass %d", view_id,
 					         device->led_model.id, pass);
