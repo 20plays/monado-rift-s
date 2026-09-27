@@ -71,6 +71,8 @@ struct rift_s_controller
 	//! bad first solve (e.g. controllers in a bad spot at startup) can not
 	//! capture the fusion yaw.
 	uint32_t yaw_trust_count;
+	//! Consecutive optical frames rejected by the continuity gate.
+	uint32_t optical_reject_count;
 
 	/* Tracking-quality diagnostics (all counters reset each summary window).
 	 * Visible with RIFT_S_LOG=debug; used to tune tracking toward Windows
@@ -86,6 +88,7 @@ struct rift_s_controller
 	uint32_t diag_yaw_bad_count;
 	uint32_t diag_nan_count;
 	uint32_t diag_stale_count;
+	uint32_t diag_reject_count;
 	float diag_max_yaw_err_deg;
 	float diag_max_opt_age_ms;
 	float diag_still_lin_accel_avg;

@@ -797,6 +797,43 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		return;
 	}
 
+	/* Continuity gate on the RAW observation, so rejected outliers never
+	 * touch the smoothing filter or the anchor. Predicts where the hand
+	 * should be from the last accepted pose plus optical velocity and
+	 * rejects absurd jumps: hand swaps when the controllers get close,
+	 * flipped PnP solutions, and mismatched blobs all move decimeters in
+	 * one 33 ms frame, which real hands cannot do. The gate scales with
+	 * speed so fast swings pass; it only engages in steady track (a valid
+	 * velocity estimate exists) and force-accepts after 10 consecutive
+	 * rejects so a bad anchor can never freeze the hand forever. Pure
+	 * linear prediction only - no integrated state, so this cannot
+	 * diverge: worst case it drops a third of a second of frames. */
+	if (ctrl->have_linear_velocity && prev_ts != 0 && frame_mono_ns > prev_ts) {
+		time_duration_ns gap_ns = frame_mono_ns - prev_ts;
+		if (gap_ns >= 15 * U_TIME_1MS_IN_NS && gap_ns <= 150 * U_TIME_1MS_IN_NS) {
+			float gap_s = (float)gap_ns / (float)U_TIME_1S_IN_NS;
+			struct xrt_vec3 predicted = {
+			    .x = ctrl->last_tracked_pose.position.x + ctrl->linear_velocity.x * gap_s,
+			    .y = ctrl->last_tracked_pose.position.y + ctrl->linear_velocity.y * gap_s,
+			    .z = ctrl->last_tracked_pose.position.z + ctrl->linear_velocity.z * gap_s,
+			};
+			float residual = m_vec3_len(m_vec3_sub(pose->position, predicted));
+			float speed = m_vec3_len(ctrl->linear_velocity);
+			float gate = 0.10f + 3.0f * speed * gap_s;
+			if (residual > gate && ctrl->optical_reject_count < 10) {
+				ctrl->optical_reject_count++;
+				ctrl->diag_reject_count++;
+				RIFT_S_DEBUG("DIAG %s REJECT residual=%.3fm gate=%.3fm pos=(%.3f,%.3f,%.3f)",
+				             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R",
+				             residual, gate, pose->position.x, pose->position.y,
+				             pose->position.z);
+				os_mutex_unlock(&ctrl->mutex);
+				return;
+			}
+		}
+	}
+	ctrl->optical_reject_count = 0;
+
 	timepoint_ns now_mono_ns = os_monotonic_get_ns();
 	ctrl->diag_opt_count++;
 
@@ -1025,12 +1062,13 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		float spd = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
 		CTRL_DIAG(
 		    "DIAG %s sum imuHz=%.0f optHz=%.1f maxAgeMs=%.0f pos=(%.3f,%.3f,%.3f) spd=%.2f "
-		    "yawApply=%u yawMove=%u yawBad=%u yawMaxDeg=%.1f tele=%u gap=%u nan=%u stale=%u stillLin=%.3f",
+		    "yawApply=%u yawMove=%u yawBad=%u yawMaxDeg=%.1f tele=%u gap=%u nan=%u stale=%u rej=%u stillLin=%.3f",
 		    ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R", imu_hz, opt_hz,
 		    ctrl->diag_max_opt_age_ms, filtered_pos.x, filtered_pos.y, filtered_pos.z, spd,
 		    ctrl->diag_yaw_apply_count, ctrl->diag_yaw_skip_count, ctrl->diag_yaw_bad_count,
 		    ctrl->diag_max_yaw_err_deg, ctrl->diag_teleport_count, ctrl->diag_gap_count,
-		    ctrl->diag_nan_count, ctrl->diag_stale_count, ctrl->diag_still_lin_accel_avg);
+		    ctrl->diag_nan_count, ctrl->diag_stale_count, ctrl->diag_reject_count,
+		    ctrl->diag_still_lin_accel_avg);
 		ctrl->diag_win_start_ns = now_mono_ns;
 		ctrl->diag_last_summary_ns = now_mono_ns;
 		ctrl->diag_imu_count = 0;
@@ -1042,6 +1080,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		ctrl->diag_yaw_bad_count = 0;
 		ctrl->diag_nan_count = 0;
 		ctrl->diag_stale_count = 0;
+		ctrl->diag_reject_count = 0;
 		ctrl->diag_max_yaw_err_deg = 0.0f;
 		ctrl->diag_max_opt_age_ms = 0.0f;
 	}
