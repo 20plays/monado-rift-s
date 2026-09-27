@@ -661,23 +661,32 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 		}
 
 		if (ctrl->have_linear_velocity) {
-			rel->linear_velocity = ctrl->linear_velocity;
+			/* Coast the anchor with exponentially decaying velocity
+			 * (tau 120 ms, horizon 150 ms). Between 30 Hz frames this
+			 * is near-full linear extrapolation, so motion is smooth
+			 * at any query rate with no deadband; during tracking
+			 * loss the hand eases to a stop instead of freezing
+			 * mid-air or flying away. Bounded by construction:
+			 * displacement saturates at |v| * tau, velocity is
+			 * clamped at 4 m/s upstream, and the decayed velocity is
+			 * what SteamVR gets for its own prediction. */
+			time_duration_ns dt_ns = at_timestamp_ns - ctrl->last_tracked_pose_ts;
+			if (dt_ns < 0) {
+				dt_ns = 0;
+			} else if (dt_ns > 150 * U_TIME_1MS_IN_NS) {
+				dt_ns = 150 * U_TIME_1MS_IN_NS;
+			}
+			float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
+			float decay = expf(-dt / 0.12f);
+			float k = 0.12f * (1.0f - decay);
+			rel->pose.position.x += ctrl->linear_velocity.x * k;
+			rel->pose.position.y += ctrl->linear_velocity.y * k;
+			rel->pose.position.z += ctrl->linear_velocity.z * k;
+			rel->linear_velocity.x = ctrl->linear_velocity.x * decay;
+			rel->linear_velocity.y = ctrl->linear_velocity.y * decay;
+			rel->linear_velocity.z = ctrl->linear_velocity.z * decay;
 			rel->relation_flags |=
 			    (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
-
-			// Extrapolate position between 30 Hz optical frames only if moving (deadband 0.04 m/s)
-			float speed = m_vec3_len(ctrl->linear_velocity);
-			if (speed > 0.04f && at_timestamp_ns > ctrl->last_tracked_pose_ts) {
-				time_duration_ns dt_ns = at_timestamp_ns - ctrl->last_tracked_pose_ts;
-				// Cap extrapolation at 35ms (~1 frame) to prevent overshoot
-				if (dt_ns > 35 * U_TIME_1MS_IN_NS) {
-					dt_ns = 35 * U_TIME_1MS_IN_NS;
-				}
-				float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
-				rel->pose.position.x += ctrl->linear_velocity.x * dt;
-				rel->pose.position.y += ctrl->linear_velocity.y * dt;
-				rel->pose.position.z += ctrl->linear_velocity.z * dt;
-			}
 		}
 	}
 	os_mutex_unlock(&ctrl->mutex);

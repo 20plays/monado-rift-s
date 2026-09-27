@@ -451,7 +451,7 @@ submit_device_pose(struct t_constellation_tracker *ct,
 				matched_blobs++;
 			}
 		}
-		average_brightness /= matched_blobs;
+		average_brightness /= matched_blobs > 0 ? matched_blobs : 1;
 
 		constellation_tracked_device_connection_notify_brightness_update(device->connection,
 		                                                                 average_brightness);
