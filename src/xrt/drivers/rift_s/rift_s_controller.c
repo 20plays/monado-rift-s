@@ -766,6 +766,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
 				ctrl->have_linear_velocity = false;
 				ctrl->pos_filter_initialized = false;
+				ctrl->yaw_trust_count = 0;
 				ctrl->diag_teleport_count++;
 				RIFT_S_DEBUG(
 				    "DIAG %s TELEPORT step=%.3fm dtMs=%.1f pos=(%.3f,%.3f,%.3f)",
@@ -805,6 +806,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
 			ctrl->have_linear_velocity = false;
 			ctrl->pos_filter_initialized = false;
+			ctrl->yaw_trust_count = 0;
 			ctrl->diag_gap_count++;
 			RIFT_S_DEBUG("DIAG %s GAP gapMs=%.1f pos=(%.3f,%.3f,%.3f)",
 			             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R",
@@ -813,13 +815,20 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		}
 	}
 
+	if (ctrl->yaw_trust_count < 1000) {
+		ctrl->yaw_trust_count++;
+	}
+
 	if (ctrl->update_yaw_from_optical) {
 		// Only correct yaw if the controller is relatively stationary.
 		// When the hand is rotating, the 1000 Hz gyroscope has zero latency
 		// whereas optical orientation is 20-30 ms stale. Snapping during motion
 		// causes severe rotational hitching.
+		// Additionally, only trust optical orientation after ~1.5 s of
+		// sustained solves: a bad (re)acquisition solve must not capture
+		// the fusion yaw while the hands are held still.
 		float gyro_speed = m_vec3_len(ctrl->fusion.last.gyro);
-		if (gyro_speed < 0.15f) { // < ~8.6 deg/s
+		if (gyro_speed < 0.15f && ctrl->yaw_trust_count >= 45) { // < ~8.6 deg/s
 			// Calculate orientation error in WORLD coordinates:
 			// q_err = q_optical * q_fusion^-1
 			struct xrt_quat fusion_inv;

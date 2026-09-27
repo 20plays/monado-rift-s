@@ -66,6 +66,11 @@ struct rift_s_controller
 	bool pos_filter_initialized;
 	//! debug boolean - enable yaw updates
 	bool update_yaw_from_optical;
+	//! Accepted optical frames since (re)acquisition; the yaw nudge only
+	//! trusts optical orientation after sustained consistent solves, so a
+	//! bad first solve (e.g. controllers in a bad spot at startup) can not
+	//! capture the fusion yaw.
+	uint32_t yaw_trust_count;
 
 	/* Tracking-quality diagnostics (all counters reset each summary window).
 	 * Visible with RIFT_S_LOG=debug; used to tune tracking toward Windows
