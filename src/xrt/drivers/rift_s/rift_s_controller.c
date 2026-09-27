@@ -655,6 +655,17 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
+static xrt_result_t
+rift_s_controller_set_output(struct xrt_device *xdev,
+                             enum xrt_output_name name,
+                             const struct xrt_output_value *value)
+{
+	/* Haptics are not driven yet. Acknowledge quietly instead of falling
+	 * through to the not-implemented handler, which logs an error on every
+	 * call and floods limited log buffers. */
+	return XRT_SUCCESS;
+}
+
 static void
 rift_s_controller_destroy(struct xrt_device *xdev)
 {
@@ -779,6 +790,46 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		             ctrl->calibration.accel.offset.y, ctrl->calibration.accel.offset.z,
 		             ctrl->calibration.gyro.offset.x, ctrl->calibration.gyro.offset.y,
 		             ctrl->calibration.gyro.offset.z);
+		/* LED cloud geometry in the raw calibration (device) frame: proves
+		 * the constellation model sits where the physical LEDs are. A
+		 * mirrored/offset cloud fits mirrored poses - systematically wrong
+		 * orientation with roughly-right position. */
+		if (ctrl->have_calibration && ctrl->calibration.num_leds > 0 && ctrl->calibration.leds != NULL) {
+			struct xrt_vec3 centroid = {0, 0, 0};
+			struct xrt_vec3 min_p = {1e9f, 1e9f, 1e9f};
+			struct xrt_vec3 max_p = {-1e9f, -1e9f, -1e9f};
+			for (int li = 0; li < ctrl->calibration.num_leds; li++) {
+				struct xrt_vec3 p = ctrl->calibration.leds[li].pos;
+				centroid.x += p.x;
+				centroid.y += p.y;
+				centroid.z += p.z;
+				if (p.x < min_p.x) {
+					min_p.x = p.x;
+				}
+				if (p.y < min_p.y) {
+					min_p.y = p.y;
+				}
+				if (p.z < min_p.z) {
+					min_p.z = p.z;
+				}
+				if (p.x > max_p.x) {
+					max_p.x = p.x;
+				}
+				if (p.y > max_p.y) {
+					max_p.y = p.y;
+				}
+				if (p.z > max_p.z) {
+					max_p.z = p.z;
+				}
+			}
+			float n = (float)ctrl->calibration.num_leds;
+			RIFT_S_DEBUG("DIAG %s leds n=%d centroid=(%.4f,%.4f,%.4f) "
+			             "min=(%.4f,%.4f,%.4f) max=(%.4f,%.4f,%.4f) imuPos=(%.4f,%.4f,%.4f)",
+			             side, ctrl->calibration.num_leds, centroid.x / n, centroid.y / n,
+			             centroid.z / n, min_p.x, min_p.y, min_p.z, max_p.x, max_p.y, max_p.z,
+			             ctrl->calibration.imu_position.x, ctrl->calibration.imu_position.y,
+			             ctrl->calibration.imu_position.z);
+		}
 	}
 
 	// Run optical position observation through One-Euro filter to remove 30 Hz camera sensor discretization noise
@@ -992,6 +1043,7 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 
 	u_device_populate_function_pointers(&ctrl->base, rift_s_controller_get_tracked_pose, rift_s_controller_destroy);
 	ctrl->base.update_inputs = rift_s_controller_update_inputs;
+	ctrl->base.set_output = rift_s_controller_set_output;
 	ctrl->base.get_view_poses = u_device_get_view_poses;
 	ctrl->base.name = XRT_DEVICE_TOUCH_CONTROLLER;
 	ctrl->base.device_type = device_type;
