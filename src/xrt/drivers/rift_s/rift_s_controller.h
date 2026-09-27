@@ -83,6 +83,9 @@ struct rift_s_controller
 	uint32_t diag_gap_count;
 	uint32_t diag_yaw_apply_count;
 	uint32_t diag_yaw_skip_count;
+	uint32_t diag_yaw_bad_count;
+	uint32_t diag_nan_count;
+	uint32_t diag_stale_count;
 	float diag_max_yaw_err_deg;
 	float diag_max_opt_age_ms;
 	float diag_still_lin_accel_avg;

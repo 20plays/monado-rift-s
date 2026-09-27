@@ -206,6 +206,13 @@ handle_imu_update(struct rift_s_controller *ctrl,
 	math_matrix_3x3_transform_vec3(&ctrl->calibration.accel.rectification, &accel, &ctrl->accel);
 	math_matrix_3x3_transform_vec3(&ctrl->calibration.gyro.rectification, &gyro, &ctrl->gyro);
 
+	/* Never feed non-finite samples to the fusion: one NaN orients the
+	 * controller to nowhere permanently. */
+	if (!isfinite(ctrl->accel.x) || !isfinite(ctrl->accel.y) || !isfinite(ctrl->accel.z) ||
+	    !isfinite(ctrl->gyro.x) || !isfinite(ctrl->gyro.y) || !isfinite(ctrl->gyro.z)) {
+		return;
+	}
+
 	m_imu_3dof_update(&ctrl->fusion, ctrl->last_imu_device_time_ns, &ctrl->accel, &ctrl->gyro);
 	ctrl->pose.orientation = ctrl->fusion.rot;
 
@@ -221,7 +228,9 @@ handle_imu_update(struct rift_s_controller *ctrl,
 		float opt_speed = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
 		if (gyro_speed < 0.15f && opt_speed < 0.05f) {
 			float m = m_vec3_len(a_world);
-			ctrl->diag_still_lin_accel_avg += 0.01f * (m - ctrl->diag_still_lin_accel_avg);
+			if (isfinite(m)) {
+				ctrl->diag_still_lin_accel_avg += 0.01f * (m - ctrl->diag_still_lin_accel_avg);
+			}
 		}
 	}
 
@@ -721,11 +730,36 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
 	os_mutex_lock(&ctrl->mutex);
 
+	timepoint_ns prev_ts = ctrl->last_tracked_pose_ts;
+
+	/* Never let a non-finite PnP solve into the pipeline: one NaN poisons
+	 * the One-Euro filter, the velocity, the anchor and (via priors) future
+	 * solves permanently. Drop the frame instead. */
+	if (!isfinite(pose->position.x) || !isfinite(pose->position.y) || !isfinite(pose->position.z) ||
+	    !isfinite(pose->orientation.x) || !isfinite(pose->orientation.y) || !isfinite(pose->orientation.z) ||
+	    !isfinite(pose->orientation.w)) {
+		ctrl->diag_nan_count++;
+		RIFT_S_DEBUG("DIAG %s NONFINITE optical solve dropped",
+		             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R");
+		os_mutex_unlock(&ctrl->mutex);
+		return;
+	}
+
+	/* Stale or duplicate observation (same or older capture time than the
+	 * anchor). Feeding it to the One-Euro filter would divide by dt=0 and
+	 * NaN the whole position pipeline, so drop it. */
+	if (prev_ts != 0 && frame_mono_ns <= prev_ts) {
+		ctrl->diag_stale_count++;
+		os_mutex_unlock(&ctrl->mutex);
+		return;
+	}
+
 	timepoint_ns now_mono_ns = os_monotonic_get_ns();
 	ctrl->diag_opt_count++;
 
 	/* One-time geometry line per session: proves which calibration the
-	 * poses are built from (IMU-to-device offset, aim-to-grip offset). */
+	 * poses are built from (IMU-to-device offset, aim-to-grip offset,
+	 * IMU scales/offsets/rates). */
 	if (!ctrl->diag_config_logged) {
 		ctrl->diag_config_logged = true;
 		const char *side = ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R";
@@ -738,6 +772,13 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		             ctrl->P_aim_grip.position.x, ctrl->P_aim_grip.position.y, ctrl->P_aim_grip.position.z,
 		             ctrl->P_aim_grip.orientation.x, ctrl->P_aim_grip.orientation.y,
 		             ctrl->P_aim_grip.orientation.z, ctrl->P_aim_grip.orientation.w);
+		RIFT_S_DEBUG("DIAG %s imuCfg config=%d accelScale=%.6f gyroScale=%.6f accelHz=%u gyroHz=%u "
+		             "accelOff=(%.4f,%.4f,%.4f) gyroOff=(%.4f,%.4f,%.4f)",
+		             side, (int)ctrl->have_config, ctrl->config.accel_scale, ctrl->config.gyro_scale,
+		             ctrl->config.accel_hz, ctrl->config.gyro_hz, ctrl->calibration.accel.offset.x,
+		             ctrl->calibration.accel.offset.y, ctrl->calibration.accel.offset.z,
+		             ctrl->calibration.gyro.offset.x, ctrl->calibration.gyro.offset.y,
+		             ctrl->calibration.gyro.offset.z);
 	}
 
 	// Run optical position observation through One-Euro filter to remove 30 Hz camera sensor discretization noise
@@ -748,7 +789,6 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	}
 	m_filter_euro_vec3_run(&ctrl->pos_filter, (uint64_t)frame_mono_ns, &pose->position, &filtered_pos);
 
-	timepoint_ns prev_ts = ctrl->last_tracked_pose_ts;
 	struct xrt_pose prev_pose = ctrl->last_tracked_pose;
 
 	ctrl->last_tracked_pose_ts = frame_mono_ns;
@@ -836,29 +876,46 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			struct xrt_quat q_err;
 			math_quat_rotate(&pose->orientation, &fusion_inv, &q_err);
 
-			// In OpenXR world space, +Y is UP (gravity axis).
-			// Extract pure rotation around World Y:
-			struct xrt_quat q_yaw = {
-			    .x = 0.0f,
-			    .y = q_err.y,
-			    .z = 0.0f,
-			    .w = q_err.w,
-			};
-			math_quat_normalize(&q_yaw);
+			/* Gate the correction. Gyro yaw drift accumulates at
+			 * degrees-per-minute, so a huge disagreement is a bad
+			 * optical solve, not drift - following it visibly rotates
+			 * still hands wrong. A near-zero yaw component would also
+			 * normalize to NaN and poison the fusion permanently. */
+			float yw_len_sq = q_err.y * q_err.y + q_err.w * q_err.w;
+			bool yaw_ok = yw_len_sq > 1e-12f;
+			float yaw_deg = 0.0f;
+			struct xrt_quat q_yaw = XRT_QUAT_IDENTITY;
+			if (yaw_ok) {
+				// In OpenXR world space, +Y is UP (gravity axis).
+				// Extract pure rotation around World Y:
+				q_yaw.x = 0.0f;
+				q_yaw.y = q_err.y;
+				q_yaw.z = 0.0f;
+				q_yaw.w = q_err.w;
+				math_quat_normalize(&q_yaw);
+				float yaw_w = fminf(fmaxf(fabsf(q_yaw.w), 0.0f), 1.0f);
+				yaw_deg = 2.0f * acosf(yaw_w) * 57.29578f;
+				yaw_ok = yaw_deg < 25.0f;
+			}
+			if (!yaw_ok) {
+				ctrl->diag_yaw_bad_count++;
+				if (yaw_deg > ctrl->diag_max_yaw_err_deg) {
+					ctrl->diag_max_yaw_err_deg = yaw_deg;
+				}
+			} else {
+				// Apply a gentle complementary filter nudge (2% per 33 ms frame)
+				struct xrt_quat correction;
+				const struct xrt_quat id = XRT_QUAT_IDENTITY;
+				math_quat_slerp(&id, &q_yaw, 0.02f, &correction);
 
-			// Apply a gentle complementary filter nudge (2% per 33 ms frame)
-			struct xrt_quat correction;
-			const struct xrt_quat id = XRT_QUAT_IDENTITY;
-			math_quat_slerp(&id, &q_yaw, 0.02f, &correction);
+				// Apply correction on the left (in world space):
+				// q_fusion_new = correction * q_fusion
+				math_quat_rotate(&correction, &ctrl->fusion.rot, &ctrl->fusion.rot);
 
-			// Apply correction on the left (in world space):
-			// q_fusion_new = correction * q_fusion
-			math_quat_rotate(&correction, &ctrl->fusion.rot, &ctrl->fusion.rot);
-
-			ctrl->diag_yaw_apply_count++;
-			float yaw_deg = 2.0f * acosf(fminf(fmaxf(fabsf(q_yaw.w), 0.0f), 1.0f)) * 57.29578f;
-			if (yaw_deg > ctrl->diag_max_yaw_err_deg) {
-				ctrl->diag_max_yaw_err_deg = yaw_deg;
+				ctrl->diag_yaw_apply_count++;
+				if (yaw_deg > ctrl->diag_max_yaw_err_deg) {
+					ctrl->diag_max_yaw_err_deg = yaw_deg;
+				}
 			}
 		} else {
 			ctrl->diag_yaw_skip_count++;
@@ -885,11 +942,12 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		float spd = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
 		RIFT_S_DEBUG(
 		    "DIAG %s sum imuHz=%.0f optHz=%.1f maxAgeMs=%.0f pos=(%.3f,%.3f,%.3f) spd=%.2f "
-		    "yawApply=%u yawMove=%u yawMaxDeg=%.1f tele=%u gap=%u stillLin=%.3f",
+		    "yawApply=%u yawMove=%u yawBad=%u yawMaxDeg=%.1f tele=%u gap=%u nan=%u stale=%u stillLin=%.3f",
 		    ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R", imu_hz, opt_hz,
 		    ctrl->diag_max_opt_age_ms, filtered_pos.x, filtered_pos.y, filtered_pos.z, spd,
-		    ctrl->diag_yaw_apply_count, ctrl->diag_yaw_skip_count, ctrl->diag_max_yaw_err_deg,
-		    ctrl->diag_teleport_count, ctrl->diag_gap_count, ctrl->diag_still_lin_accel_avg);
+		    ctrl->diag_yaw_apply_count, ctrl->diag_yaw_skip_count, ctrl->diag_yaw_bad_count,
+		    ctrl->diag_max_yaw_err_deg, ctrl->diag_teleport_count, ctrl->diag_gap_count,
+		    ctrl->diag_nan_count, ctrl->diag_stale_count, ctrl->diag_still_lin_accel_avg);
 		ctrl->diag_win_start_ns = now_mono_ns;
 		ctrl->diag_last_summary_ns = now_mono_ns;
 		ctrl->diag_imu_count = 0;
@@ -898,6 +956,9 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		ctrl->diag_gap_count = 0;
 		ctrl->diag_yaw_apply_count = 0;
 		ctrl->diag_yaw_skip_count = 0;
+		ctrl->diag_yaw_bad_count = 0;
+		ctrl->diag_nan_count = 0;
+		ctrl->diag_stale_count = 0;
 		ctrl->diag_max_yaw_err_deg = 0.0f;
 		ctrl->diag_max_opt_age_ms = 0.0f;
 	}
