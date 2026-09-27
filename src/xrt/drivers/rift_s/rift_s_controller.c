@@ -209,6 +209,22 @@ handle_imu_update(struct rift_s_controller *ctrl,
 	m_imu_3dof_update(&ctrl->fusion, ctrl->last_imu_device_time_ns, &ctrl->accel, &ctrl->gyro);
 	ctrl->pose.orientation = ctrl->fusion.rot;
 
+	/* Diagnostics: usable IMU sample rate, plus mean linear-accel magnitude
+	 * while stationary (reveals gravity leakage / accel bias: should sit
+	 * near 0.00 m/s^2 when the hand is still). */
+	ctrl->diag_imu_count++;
+	{
+		struct xrt_vec3 a_world;
+		math_quat_rotate_vec3(&ctrl->fusion.rot, &ctrl->accel, &a_world);
+		a_world.y -= (float)MATH_GRAVITY_M_S2;
+		float gyro_speed = m_vec3_len(ctrl->gyro);
+		float opt_speed = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
+		if (gyro_speed < 0.15f && opt_speed < 0.05f) {
+			float m = m_vec3_len(a_world);
+			ctrl->diag_still_lin_accel_avg += 0.01f * (m - ctrl->diag_still_lin_accel_avg);
+		}
+	}
+
 #if 0
 	RIFT_S_DEBUG("%" PRIx64 " dt %u device time %u ns %" PRIu64
 	             " raw accel %d %d %d gyro %d %d %d -> accel %f %f %f  gyro %f %f %f\n",
@@ -595,6 +611,14 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 		rel->relation_flags |= (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
 		                                                       XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
 
+		/* Diagnostics: how stale the optical anchor is at query time.
+		 * Reported as the window maximum in the periodic summary. */
+		float age_ms =
+		    (float)(at_timestamp_ns - ctrl->last_tracked_pose_ts) / (float)U_TIME_1MS_IN_NS;
+		if (age_ms > ctrl->diag_max_opt_age_ms) {
+			ctrl->diag_max_opt_age_ms = age_ms;
+		}
+
 		if (ctrl->have_linear_velocity) {
 			rel->linear_velocity = ctrl->linear_velocity;
 			rel->relation_flags |=
@@ -697,6 +721,25 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
 	os_mutex_lock(&ctrl->mutex);
 
+	timepoint_ns now_mono_ns = os_monotonic_get_ns();
+	ctrl->diag_opt_count++;
+
+	/* One-time geometry line per session: proves which calibration the
+	 * poses are built from (IMU-to-device offset, aim-to-grip offset). */
+	if (!ctrl->diag_config_logged) {
+		ctrl->diag_config_logged = true;
+		const char *side = ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R";
+		RIFT_S_DEBUG("DIAG %s cfg calib=%d P_imu_device pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f) "
+		             "P_aim_grip pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f)",
+		             side, (int)ctrl->have_calibration, ctrl->P_imu_device.position.x,
+		             ctrl->P_imu_device.position.y, ctrl->P_imu_device.position.z,
+		             ctrl->P_imu_device.orientation.x, ctrl->P_imu_device.orientation.y,
+		             ctrl->P_imu_device.orientation.z, ctrl->P_imu_device.orientation.w,
+		             ctrl->P_aim_grip.position.x, ctrl->P_aim_grip.position.y, ctrl->P_aim_grip.position.z,
+		             ctrl->P_aim_grip.orientation.x, ctrl->P_aim_grip.orientation.y,
+		             ctrl->P_aim_grip.orientation.z, ctrl->P_aim_grip.orientation.w);
+	}
+
 	// Run optical position observation through One-Euro filter to remove 30 Hz camera sensor discretization noise
 	struct xrt_vec3 filtered_pos;
 	if (!ctrl->pos_filter_initialized) {
@@ -723,6 +766,12 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
 				ctrl->have_linear_velocity = false;
 				ctrl->pos_filter_initialized = false;
+				ctrl->diag_teleport_count++;
+				RIFT_S_DEBUG(
+				    "DIAG %s TELEPORT step=%.3fm dtMs=%.1f pos=(%.3f,%.3f,%.3f)",
+				    ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R", step_dist,
+				    (float)dt_ns / (float)U_TIME_1MS_IN_NS, filtered_pos.x, filtered_pos.y,
+				    filtered_pos.z);
 			} else {
 				float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
 				struct xrt_vec3 inst_vel = {
@@ -756,6 +805,11 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
 			ctrl->have_linear_velocity = false;
 			ctrl->pos_filter_initialized = false;
+			ctrl->diag_gap_count++;
+			RIFT_S_DEBUG("DIAG %s GAP gapMs=%.1f pos=(%.3f,%.3f,%.3f)",
+			             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R",
+			             (float)dt_ns / (float)U_TIME_1MS_IN_NS, filtered_pos.x, filtered_pos.y,
+			             filtered_pos.z);
 		}
 	}
 
@@ -791,10 +845,53 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			// Apply correction on the left (in world space):
 			// q_fusion_new = correction * q_fusion
 			math_quat_rotate(&correction, &ctrl->fusion.rot, &ctrl->fusion.rot);
+
+			ctrl->diag_yaw_apply_count++;
+			float yaw_deg = 2.0f * acosf(fminf(fmaxf(fabsf(q_yaw.w), 0.0f), 1.0f)) * 57.29578f;
+			if (yaw_deg > ctrl->diag_max_yaw_err_deg) {
+				ctrl->diag_max_yaw_err_deg = yaw_deg;
+			}
+		} else {
+			ctrl->diag_yaw_skip_count++;
 		}
 	}
 	// Update pose position for the debug UI
 	ctrl->pose.position = filtered_pos;
+
+	/* Periodic per-controller summary (every 2 s): the single line that
+	 * tells us whether tracking is healthy. IMU rate proves the radio
+	 * link, optical rate proves the constellation solver, max query age
+	 * proves freshness, |v| + teleport/gap counts prove stability, yaw
+	 * counts prove the still-hands correction behaviour, and stillLin
+	 * proves the accelerometer frame (expect ~0.00 when still). */
+	if (ctrl->diag_win_start_ns == 0) {
+		ctrl->diag_win_start_ns = now_mono_ns;
+		ctrl->diag_last_summary_ns = now_mono_ns;
+	}
+	if (now_mono_ns - ctrl->diag_last_summary_ns >= 2 * U_TIME_1S_IN_NS) {
+		float win_s =
+		    (float)(now_mono_ns - ctrl->diag_win_start_ns) / (float)U_TIME_1S_IN_NS;
+		float imu_hz = win_s > 0.0f ? (float)ctrl->diag_imu_count / win_s : 0.0f;
+		float opt_hz = win_s > 0.0f ? (float)ctrl->diag_opt_count / win_s : 0.0f;
+		float spd = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
+		RIFT_S_DEBUG(
+		    "DIAG %s sum imuHz=%.0f optHz=%.1f maxAgeMs=%.0f pos=(%.3f,%.3f,%.3f) spd=%.2f "
+		    "yawApply=%u yawMove=%u yawMaxDeg=%.1f tele=%u gap=%u stillLin=%.3f",
+		    ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R", imu_hz, opt_hz,
+		    ctrl->diag_max_opt_age_ms, filtered_pos.x, filtered_pos.y, filtered_pos.z, spd,
+		    ctrl->diag_yaw_apply_count, ctrl->diag_yaw_skip_count, ctrl->diag_max_yaw_err_deg,
+		    ctrl->diag_teleport_count, ctrl->diag_gap_count, ctrl->diag_still_lin_accel_avg);
+		ctrl->diag_win_start_ns = now_mono_ns;
+		ctrl->diag_last_summary_ns = now_mono_ns;
+		ctrl->diag_imu_count = 0;
+		ctrl->diag_opt_count = 0;
+		ctrl->diag_teleport_count = 0;
+		ctrl->diag_gap_count = 0;
+		ctrl->diag_yaw_apply_count = 0;
+		ctrl->diag_yaw_skip_count = 0;
+		ctrl->diag_max_yaw_err_deg = 0.0f;
+		ctrl->diag_max_opt_age_ms = 0.0f;
+	}
 	os_mutex_unlock(&ctrl->mutex);
 }
 

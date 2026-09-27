@@ -67,6 +67,22 @@ struct rift_s_controller
 	//! debug boolean - enable yaw updates
 	bool update_yaw_from_optical;
 
+	/* Tracking-quality diagnostics (all counters reset each summary window).
+	 * Visible with RIFT_S_LOG=debug; used to tune tracking toward Windows
+	 * parity with real session data instead of guesses. */
+	timepoint_ns diag_win_start_ns;
+	timepoint_ns diag_last_summary_ns;
+	uint32_t diag_imu_count;
+	uint32_t diag_opt_count;
+	uint32_t diag_teleport_count;
+	uint32_t diag_gap_count;
+	uint32_t diag_yaw_apply_count;
+	uint32_t diag_yaw_skip_count;
+	float diag_max_yaw_err_deg;
+	float diag_max_opt_age_ms;
+	float diag_still_lin_accel_avg;
+	bool diag_config_logged;
+
 	/* Debug logs */
 	/* 0x04 = new log line
 	 * 0x02 = parity bit, toggles each line when receiving log chars
