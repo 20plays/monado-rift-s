@@ -826,7 +826,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			    .y = ctrl->last_tracked_pose.position.y + ctrl->linear_velocity.y * gap_s,
 			    .z = ctrl->last_tracked_pose.position.z + ctrl->linear_velocity.z * gap_s,
 			};
-			float residual = m_vec3_len(m_vec3_sub(pose->position, predicted));
+		float residual = m_vec3_len(m_vec3_sub(pose->position, predicted));
 			float speed = m_vec3_len(ctrl->linear_velocity);
 			float gate = 0.07f + 3.0f * speed * gap_s;
 			if (residual > gate && ctrl->optical_reject_count < 10) {
@@ -839,6 +839,15 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				             pose->position.z);
 				os_mutex_unlock(&ctrl->mutex);
 				return;
+			}
+			if (residual > gate) {
+				/* Force-accepted after 10 straight rejects: the anchor
+				 * may be wrong, so don't trust the old velocity -
+				 * drop it like a teleport to avoid coasting away on a
+				 * stale vector. It rebuilds from the new anchor. */
+				ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
+				ctrl->have_linear_velocity = false;
+				ctrl->pos_filter_initialized = false;
 			}
 		}
 	}
