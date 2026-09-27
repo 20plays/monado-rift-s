@@ -379,9 +379,9 @@ receive_cam_frame(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 		return;
 	}
 
-	RIFT_S_DEBUG("frame ctr %u ts %" PRIu64
-	             " µS pair ctr %u "
-	             "exposure[0] %u gain[0] %u unk %u",
+	RIFT_S_TRACE("frame ctr %u ts %" PRIu64
+	              " µS pair ctr %u "
+	              "exposure[0] %u gain[0] %u unk %u",
 	             (uint16_t)__le16_to_cpu(row_data.data.frame_ctr), (uint64_t)__le64_to_cpu(row_data.data.frame_ts),
 	             (uint32_t)__le32_to_cpu(row_data.data.frame_ctr2),
 	             (uint16_t)__le16_to_cpu(row_data.data.slam_exposure[0]), row_data.data.slam_gain[0],
