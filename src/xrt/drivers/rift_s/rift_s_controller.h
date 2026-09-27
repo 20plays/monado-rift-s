@@ -73,6 +73,10 @@ struct rift_s_controller
 	uint32_t yaw_trust_count;
 	//! Consecutive optical frames rejected by the continuity gate.
 	uint32_t optical_reject_count;
+	//! Stable large-error consensus for yaw repair (mean/count of signed
+	//! yaw errors agreeing within 10 degrees while still).
+	float yaw_consensus_mean_deg;
+	uint32_t yaw_consensus_count;
 
 	/* Tracking-quality diagnostics (all counters reset each summary window).
 	 * Visible with RIFT_S_LOG=debug; used to tune tracking toward Windows

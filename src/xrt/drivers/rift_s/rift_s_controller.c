@@ -662,10 +662,10 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 
 		if (ctrl->have_linear_velocity) {
 			/* Coast the anchor with exponentially decaying velocity
-			 * (tau 120 ms, horizon 150 ms). Between 30 Hz frames this
+			 * (tau 200 ms, horizon 250 ms). Between 30 Hz frames this
 			 * is near-full linear extrapolation, so motion is smooth
 			 * at any query rate with no deadband; during tracking
-			 * loss the hand eases to a stop instead of freezing
+			 * loss the hand glides to a stop instead of freezing
 			 * mid-air or flying away. Bounded by construction:
 			 * displacement saturates at |v| * tau, velocity is
 			 * clamped at 4 m/s upstream, and the decayed velocity is
@@ -673,12 +673,12 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 			time_duration_ns dt_ns = at_timestamp_ns - ctrl->last_tracked_pose_ts;
 			if (dt_ns < 0) {
 				dt_ns = 0;
-			} else if (dt_ns > 150 * U_TIME_1MS_IN_NS) {
-				dt_ns = 150 * U_TIME_1MS_IN_NS;
+			} else if (dt_ns > 250 * U_TIME_1MS_IN_NS) {
+				dt_ns = 250 * U_TIME_1MS_IN_NS;
 			}
 			float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
-			float decay = expf(-dt / 0.12f);
-			float k = 0.12f * (1.0f - decay);
+			float decay = expf(-dt / 0.2f);
+			float k = 0.2f * (1.0f - decay);
 			rel->pose.position.x += ctrl->linear_velocity.x * k;
 			rel->pose.position.y += ctrl->linear_velocity.y * k;
 			rel->pose.position.z += ctrl->linear_velocity.z * k;
@@ -828,11 +828,12 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			};
 			float residual = m_vec3_len(m_vec3_sub(pose->position, predicted));
 			float speed = m_vec3_len(ctrl->linear_velocity);
-			float gate = 0.10f + 3.0f * speed * gap_s;
+			float gate = 0.07f + 3.0f * speed * gap_s;
 			if (residual > gate && ctrl->optical_reject_count < 10) {
 				ctrl->optical_reject_count++;
 				ctrl->diag_reject_count++;
-				RIFT_S_DEBUG("DIAG %s REJECT residual=%.3fm gate=%.3fm pos=(%.3f,%.3f,%.3f)",
+				ctrl->yaw_consensus_count = 0;
+				CTRL_DIAG("DIAG %s REJECT residual=%.3fm gate=%.3fm pos=(%.3f,%.3f,%.3f)",
 				             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R",
 				             residual, gate, pose->position.x, pose->position.y,
 				             pose->position.z);
@@ -936,6 +937,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				ctrl->have_linear_velocity = false;
 				ctrl->pos_filter_initialized = false;
 				ctrl->yaw_trust_count = 0;
+				ctrl->yaw_consensus_count = 0;
 				ctrl->diag_teleport_count++;
 				CTRL_DIAG(
 				    "DIAG %s TELEPORT step=%.3fm dtMs=%.1f pos=(%.3f,%.3f,%.3f)",
@@ -976,6 +978,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			ctrl->have_linear_velocity = false;
 			ctrl->pos_filter_initialized = false;
 			ctrl->yaw_trust_count = 0;
+			ctrl->yaw_consensus_count = 0;
 			ctrl->diag_gap_count++;
 			CTRL_DIAG("DIAG %s GAP gapMs=%.1f pos=(%.3f,%.3f,%.3f)",
 			             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R",
@@ -1013,6 +1016,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			float yw_len_sq = q_err.y * q_err.y + q_err.w * q_err.w;
 			bool yaw_ok = yw_len_sq > 1e-12f;
 			float yaw_deg = 0.0f;
+			float yaw_signed_deg = 0.0f;
 			struct xrt_quat q_yaw = XRT_QUAT_IDENTITY;
 			if (yaw_ok) {
 				// In OpenXR world space, +Y is UP (gravity axis).
@@ -1024,6 +1028,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				math_quat_normalize(&q_yaw);
 				float yaw_w = fminf(fmaxf(fabsf(q_yaw.w), 0.0f), 1.0f);
 				yaw_deg = 2.0f * acosf(yaw_w) * 57.29578f;
+				yaw_signed_deg = 2.0f * atan2f(q_yaw.y, q_yaw.w) * 57.29578f;
 				yaw_ok = yaw_deg < 25.0f;
 			}
 			if (!yaw_ok) {
@@ -1031,7 +1036,39 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				if (yaw_deg > ctrl->diag_max_yaw_err_deg) {
 					ctrl->diag_max_yaw_err_deg = yaw_deg;
 				}
+				/* Consensus repair: flips oscillate frame to frame,
+				 * but a genuinely wrong fusion yaw disagrees with good
+				 * optical solves by a STABLE large angle. After 6 still
+				 * frames agreeing within 10 degrees, apply the full
+				 * correction at once instead of never converging. */
+				if (yw_len_sq > 1e-12f) {
+					if (ctrl->yaw_consensus_count == 0 ||
+					    fabsf(yaw_signed_deg - ctrl->yaw_consensus_mean_deg) < 10.0f) {
+						ctrl->yaw_consensus_mean_deg =
+						    (ctrl->yaw_consensus_mean_deg *
+						         (float)ctrl->yaw_consensus_count +
+						     yaw_signed_deg) /
+						    (float)(ctrl->yaw_consensus_count + 1);
+						ctrl->yaw_consensus_count++;
+					} else {
+						ctrl->yaw_consensus_mean_deg = yaw_signed_deg;
+						ctrl->yaw_consensus_count = 1;
+					}
+					if (ctrl->yaw_consensus_count >= 6 &&
+					    fabsf(ctrl->yaw_consensus_mean_deg) > 25.0f) {
+						float half_rad = ctrl->yaw_consensus_mean_deg * 0.5f / 57.29578f;
+						struct xrt_quat snap = {0.0f, sinf(half_rad), 0.0f, cosf(half_rad)};
+						math_quat_rotate(&snap, &ctrl->fusion.rot, &ctrl->fusion.rot);
+						ctrl->diag_yaw_apply_count++;
+						ctrl->yaw_consensus_count = 0;
+						ctrl->yaw_consensus_mean_deg = 0.0f;
+					}
+				} else {
+					ctrl->yaw_consensus_count = 0;
+				}
 			} else {
+				// Small error: gentle nudge handles it; consensus is for large errors only.
+				ctrl->yaw_consensus_count = 0;
 				// Apply a gentle complementary filter nudge (2% per 33 ms frame)
 				struct xrt_quat correction;
 				const struct xrt_quat id = XRT_QUAT_IDENTITY;
