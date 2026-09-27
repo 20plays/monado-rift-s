@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <stdarg.h>
 
 #include "math/m_api.h"
 #include "math/m_space.h"
@@ -41,6 +42,37 @@
 
 /* Set to 1 to print controller states continuously */
 #define DUMP_CONTROLLER_STATE 0
+
+/* Diagnostic file logging: set RIFT_S_DIAG_FILE=/path/to.log and every
+ * DIAG line is appended there (in addition to the log view), so full
+ * sessions survive truncated UI buffers. The file is opened per line -
+ * negligible overhead at this rate, zero shared state or lifecycle bugs. */
+static void
+rift_s_diag_file_log(const char *fmt, ...)
+{
+	const char *path = getenv("RIFT_S_DIAG_FILE");
+	if (path == NULL || path[0] == '\0') {
+		return;
+	}
+	char buf[1024];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	FILE *f = fopen(path, "a");
+	if (f == NULL) {
+		return;
+	}
+	fprintf(f, "%llu %s\n", (unsigned long long)os_monotonic_get_ns() / 1000000ULL, buf);
+	fclose(f);
+}
+
+#define CTRL_DIAG(...)                                                                                               \
+	do {                                                                                                         \
+		RIFT_S_DEBUG(__VA_ARGS__);                                                                           \
+		rift_s_diag_file_log(__VA_ARGS__);                                                                   \
+	} while (0)
 
 DEBUG_GET_ONCE_BOOL_OPTION(flip_left_yaw, "RIFT_S_FLIP_LEFT_YAW", false)
 
@@ -750,7 +782,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	    !isfinite(pose->orientation.x) || !isfinite(pose->orientation.y) || !isfinite(pose->orientation.z) ||
 	    !isfinite(pose->orientation.w)) {
 		ctrl->diag_nan_count++;
-		RIFT_S_DEBUG("DIAG %s NONFINITE optical solve dropped",
+		CTRL_DIAG("DIAG %s NONFINITE optical solve dropped",
 		             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R");
 		os_mutex_unlock(&ctrl->mutex);
 		return;
@@ -774,7 +806,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	if (!ctrl->diag_config_logged) {
 		ctrl->diag_config_logged = true;
 		const char *side = ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R";
-		RIFT_S_DEBUG("DIAG %s cfg calib=%d P_imu_device pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f) "
+		CTRL_DIAG("DIAG %s cfg calib=%d P_imu_device pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f) "
 		             "P_aim_grip pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f)",
 		             side, (int)ctrl->have_calibration, ctrl->P_imu_device.position.x,
 		             ctrl->P_imu_device.position.y, ctrl->P_imu_device.position.z,
@@ -783,7 +815,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		             ctrl->P_aim_grip.position.x, ctrl->P_aim_grip.position.y, ctrl->P_aim_grip.position.z,
 		             ctrl->P_aim_grip.orientation.x, ctrl->P_aim_grip.orientation.y,
 		             ctrl->P_aim_grip.orientation.z, ctrl->P_aim_grip.orientation.w);
-		RIFT_S_DEBUG("DIAG %s imuCfg config=%d accelScale=%.6f gyroScale=%.6f accelHz=%u gyroHz=%u "
+		CTRL_DIAG("DIAG %s imuCfg config=%d accelScale=%.6f gyroScale=%.6f accelHz=%u gyroHz=%u "
 		             "accelOff=(%.4f,%.4f,%.4f) gyroOff=(%.4f,%.4f,%.4f)",
 		             side, (int)ctrl->have_config, ctrl->config.accel_scale, ctrl->config.gyro_scale,
 		             ctrl->config.accel_hz, ctrl->config.gyro_hz, ctrl->calibration.accel.offset.x,
@@ -823,7 +855,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				}
 			}
 			float n = (float)ctrl->calibration.num_leds;
-			RIFT_S_DEBUG("DIAG %s leds n=%d centroid=(%.4f,%.4f,%.4f) "
+			CTRL_DIAG("DIAG %s leds n=%d centroid=(%.4f,%.4f,%.4f) "
 			             "min=(%.4f,%.4f,%.4f) max=(%.4f,%.4f,%.4f) imuPos=(%.4f,%.4f,%.4f)",
 			             side, ctrl->calibration.num_leds, centroid.x / n, centroid.y / n,
 			             centroid.z / n, min_p.x, min_p.y, min_p.z, max_p.x, max_p.y, max_p.z,
@@ -859,7 +891,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 				ctrl->pos_filter_initialized = false;
 				ctrl->yaw_trust_count = 0;
 				ctrl->diag_teleport_count++;
-				RIFT_S_DEBUG(
+				CTRL_DIAG(
 				    "DIAG %s TELEPORT step=%.3fm dtMs=%.1f pos=(%.3f,%.3f,%.3f)",
 				    ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R", step_dist,
 				    (float)dt_ns / (float)U_TIME_1MS_IN_NS, filtered_pos.x, filtered_pos.y,
@@ -899,7 +931,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 			ctrl->pos_filter_initialized = false;
 			ctrl->yaw_trust_count = 0;
 			ctrl->diag_gap_count++;
-			RIFT_S_DEBUG("DIAG %s GAP gapMs=%.1f pos=(%.3f,%.3f,%.3f)",
+			CTRL_DIAG("DIAG %s GAP gapMs=%.1f pos=(%.3f,%.3f,%.3f)",
 			             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R",
 			             (float)dt_ns / (float)U_TIME_1MS_IN_NS, filtered_pos.x, filtered_pos.y,
 			             filtered_pos.z);
@@ -991,7 +1023,7 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 		float imu_hz = win_s > 0.0f ? (float)ctrl->diag_imu_count / win_s : 0.0f;
 		float opt_hz = win_s > 0.0f ? (float)ctrl->diag_opt_count / win_s : 0.0f;
 		float spd = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
-		RIFT_S_DEBUG(
+		CTRL_DIAG(
 		    "DIAG %s sum imuHz=%.0f optHz=%.1f maxAgeMs=%.0f pos=(%.3f,%.3f,%.3f) spd=%.2f "
 		    "yawApply=%u yawMove=%u yawBad=%u yawMaxDeg=%.1f tele=%u gap=%u nan=%u stale=%u stillLin=%.3f",
 		    ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R", imu_hz, opt_hz,
