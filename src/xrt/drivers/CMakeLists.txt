@@ -346,6 +346,8 @@ if(XRT_BUILD_DRIVER_RIFT_S)
 		rift_s/rift_s_interface.h
 		rift_s/rift_s_camera.c
 		rift_s/rift_s_camera.h
+		rift_s/rift_s_clock_sync.c
+		rift_s/rift_s_clock_sync.h
 		rift_s/rift_s_controller.c
 		rift_s/rift_s_controller.h
 		rift_s/rift_s_firmware.c

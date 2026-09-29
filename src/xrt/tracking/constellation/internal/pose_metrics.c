@@ -431,6 +431,12 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 		score->match_flags |= POSE_MATCH_LED_IDS;
 	}
 
+	/* No matched blobs: nothing to score (and the division below would
+	 * produce inf/NaN). */
+	if (score->matched_blobs == 0) {
+		goto done;
+	}
+
 	double error_per_led = score->reprojection_error / score->matched_blobs;
 
 	/* If we have a pose prior, calculate the rotation and translation error and match flags as needed */

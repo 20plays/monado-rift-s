@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <stdarg.h>
 
 #include "math/m_api.h"
 #include "math/m_space.h"
@@ -28,8 +29,10 @@
 #include "os/os_hid.h"
 
 #include "util/u_device.h"
+#include "util/u_time.h"
 #include "util/u_trace_marker.h"
 #include "util/u_var.h"
+#include "util/u_debug.h"
 
 #include "rift_s.h"
 #include "rift_s_hmd.h"
@@ -39,6 +42,39 @@
 
 /* Set to 1 to print controller states continuously */
 #define DUMP_CONTROLLER_STATE 0
+
+/* Diagnostic file logging: set RIFT_S_DIAG_FILE=/path/to.log and every
+ * DIAG line is appended there (in addition to the log view), so full
+ * sessions survive truncated UI buffers. The file is opened per line -
+ * negligible overhead at this rate, zero shared state or lifecycle bugs. */
+static void
+rift_s_diag_file_log(const char *fmt, ...)
+{
+	const char *path = getenv("RIFT_S_DIAG_FILE");
+	if (path == NULL || path[0] == '\0') {
+		return;
+	}
+	char buf[1024];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	FILE *f = fopen(path, "a");
+	if (f == NULL) {
+		return;
+	}
+	fprintf(f, "%llu %s\n", (unsigned long long)os_monotonic_get_ns() / 1000000ULL, buf);
+	fclose(f);
+}
+
+#define CTRL_DIAG(...)                                                                                               \
+	do {                                                                                                         \
+		RIFT_S_DEBUG(__VA_ARGS__);                                                                           \
+		rift_s_diag_file_log(__VA_ARGS__);                                                                   \
+	} while (0)
+
+DEBUG_GET_ONCE_BOOL_OPTION(flip_left_yaw, "RIFT_S_FLIP_LEFT_YAW", false)
 
 static struct xrt_binding_input_pair simple_inputs_rift_s[4] = {
     {XRT_INPUT_SIMPLE_SELECT_CLICK, XRT_INPUT_TOUCH_TRIGGER_VALUE},
@@ -202,8 +238,33 @@ handle_imu_update(struct rift_s_controller *ctrl,
 	math_matrix_3x3_transform_vec3(&ctrl->calibration.accel.rectification, &accel, &ctrl->accel);
 	math_matrix_3x3_transform_vec3(&ctrl->calibration.gyro.rectification, &gyro, &ctrl->gyro);
 
+	/* Never feed non-finite samples to the fusion: one NaN orients the
+	 * controller to nowhere permanently. */
+	if (!isfinite(ctrl->accel.x) || !isfinite(ctrl->accel.y) || !isfinite(ctrl->accel.z) ||
+	    !isfinite(ctrl->gyro.x) || !isfinite(ctrl->gyro.y) || !isfinite(ctrl->gyro.z)) {
+		return;
+	}
+
 	m_imu_3dof_update(&ctrl->fusion, ctrl->last_imu_device_time_ns, &ctrl->accel, &ctrl->gyro);
 	ctrl->pose.orientation = ctrl->fusion.rot;
+
+	/* Diagnostics: usable IMU sample rate, plus mean linear-accel magnitude
+	 * while stationary (reveals gravity leakage / accel bias: should sit
+	 * near 0.00 m/s^2 when the hand is still). */
+	ctrl->diag_imu_count++;
+	{
+		struct xrt_vec3 a_world;
+		math_quat_rotate_vec3(&ctrl->fusion.rot, &ctrl->accel, &a_world);
+		a_world.y -= (float)MATH_GRAVITY_M_S2;
+		float gyro_speed = m_vec3_len(ctrl->gyro);
+		float opt_speed = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
+		if (gyro_speed < 0.15f && opt_speed < 0.05f) {
+			float m = m_vec3_len(a_world);
+			if (isfinite(m)) {
+				ctrl->diag_still_lin_accel_avg += 0.01f * (m - ctrl->diag_still_lin_accel_avg);
+			}
+		}
+	}
 
 #if 0
 	RIFT_S_DEBUG("%" PRIx64 " dt %u device time %u ns %" PRIu64
@@ -352,14 +413,19 @@ static void
 ctrl_config_cb(bool success, uint8_t *response_bytes, int response_bytes_len, struct rift_s_controller *ctrl)
 {
 	if (!success) {
-		RIFT_S_WARN("Failed to read controller config");
+		os_mutex_lock(&ctrl->mutex);
+		ctrl->reading_config = false;
+		os_mutex_unlock(&ctrl->mutex);
+		RIFT_S_WARN("Failed to read config for controller 0x%016" PRIx64 "; will retry", ctrl->device_id);
 		return;
 	}
 
-	ctrl->reading_config = false;
-
 	if (response_bytes_len < 5) {
-		RIFT_S_WARN("Failed to read controller config - short result");
+		os_mutex_lock(&ctrl->mutex);
+		ctrl->reading_config = false;
+		os_mutex_unlock(&ctrl->mutex);
+		RIFT_S_WARN("Failed to read config for controller 0x%016" PRIx64 " (short result %d bytes); will retry",
+		            ctrl->device_id, response_bytes_len);
 		return;
 	}
 
@@ -378,10 +444,17 @@ ctrl_config_cb(bool success, uint8_t *response_bytes, int response_bytes_len, st
 		printed += rift_s_snprintf_hexdump_buffer(buf + printed, bufsize - printed, "Controller Config",
 		                                          response_bytes, response_bytes_len);
 
-		RIFT_S_ERROR("Failed to read controller config block - only got %d bytes\n%s", response_bytes_len, buf);
+		os_mutex_lock(&ctrl->mutex);
+		ctrl->reading_config = false;
+		os_mutex_unlock(&ctrl->mutex);
+		RIFT_S_WARN("Failed to read config block for controller 0x%016" PRIx64 " (got %d bytes); will retry\n%s",
+		            ctrl->device_id, response_bytes_len, buf);
 		return;
 	}
 	response_bytes += 5;
+
+	os_mutex_lock(&ctrl->mutex);
+	ctrl->reading_config = false;
 
 	ctrl->config.accel_limit = READ_LE16(response_bytes + 0);
 	ctrl->config.gyro_limit = READ_LE16(response_bytes + 2);
@@ -391,8 +464,9 @@ ctrl_config_cb(bool success, uint8_t *response_bytes, int response_bytes_len, st
 	ctrl->config.gyro_scale = READ_LEFLOAT32(response_bytes + 12);
 
 	ctrl->have_config = true;
+	os_mutex_unlock(&ctrl->mutex);
 
-	RIFT_S_INFO("Read config for controller 0x%16" PRIx64
+	RIFT_S_INFO("Read config for controller 0x%016" PRIx64
 	            " type %08x. "
 	            "limit/scale/hz Accel %u %f %u Gyro %u %f %u",
 	            ctrl->device_id, ctrl->device_type, ctrl->config.accel_limit, ctrl->config.accel_scale,
@@ -403,7 +477,11 @@ static void
 ctrl_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, struct rift_s_controller *ctrl)
 {
 	if (!success) {
-		RIFT_S_DEBUG("Failed to read controller calibration block");
+		os_mutex_lock(&ctrl->mutex);
+		ctrl->reading_calibration = false;
+		os_mutex_unlock(&ctrl->mutex);
+		RIFT_S_WARN("Failed to read calibration block for controller 0x%016" PRIx64 "; will retry",
+		            ctrl->device_id);
 		return;
 	}
 
@@ -417,8 +495,8 @@ ctrl_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, stru
 		math_pose_invert(&ctrl->P_device_imu, &ctrl->P_imu_device);
 		ctrl->have_calibration = true;
 	} else {
-		RIFT_S_ERROR("Failed to parse controller configuration for controller 0x%16" PRIx64 "\n",
-		             ctrl->device_id);
+		RIFT_S_WARN("Failed to parse calibration for controller 0x%016" PRIx64 "; will retry",
+		            ctrl->device_id);
 	}
 	os_mutex_unlock(&ctrl->mutex);
 }
@@ -553,12 +631,17 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 	struct xrt_relation_chain xrc = {0};
 
 	os_mutex_lock(&ctrl->mutex);
-	if (name == XRT_INPUT_TOUCH_AIM_POSE) {
-		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
-	} else if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
-		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
+	if (ctrl->flip_left_yaw) {
+		struct xrt_pose flip = {
+		    .orientation = {.x = 0.0f, .y = 1.0f, .z = 0.0f, .w = 0.0f},
+		    .position = {0.0f, 0.0f, 0.0f},
+		};
+		m_relation_chain_push_pose(&xrc, &flip);
+	}
+	if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
 		m_relation_chain_push_pose(&xrc, &ctrl->P_aim_grip);
 	}
+	m_relation_chain_push_pose_if_not_identity(&xrc, &ctrl->P_imu_device);
 
 	/* Apply the fusion rotation */
 	struct xrt_space_relation *rel = m_relation_chain_reserve(&xrc);
@@ -568,11 +651,59 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
 		rel->pose.position = ctrl->last_tracked_pose.position;
 		rel->relation_flags |= (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
 		                                                       XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+
+		/* Diagnostics: how stale the optical anchor is at query time.
+		 * Reported as the window maximum in the periodic summary. */
+		float age_ms =
+		    (float)(at_timestamp_ns - ctrl->last_tracked_pose_ts) / (float)U_TIME_1MS_IN_NS;
+		if (age_ms > ctrl->diag_max_opt_age_ms) {
+			ctrl->diag_max_opt_age_ms = age_ms;
+		}
+
+		if (ctrl->have_linear_velocity) {
+			/* Coast the anchor with exponentially decaying velocity
+			 * (tau 200 ms, horizon 250 ms). Between 30 Hz frames this
+			 * is near-full linear extrapolation, so motion is smooth
+			 * at any query rate with no deadband; during tracking
+			 * loss the hand glides to a stop instead of freezing
+			 * mid-air or flying away. Bounded by construction:
+			 * displacement saturates at |v| * tau, velocity is
+			 * clamped at 4 m/s upstream, and the decayed velocity is
+			 * what SteamVR gets for its own prediction. */
+			time_duration_ns dt_ns = at_timestamp_ns - ctrl->last_tracked_pose_ts;
+			if (dt_ns < 0) {
+				dt_ns = 0;
+			} else if (dt_ns > 250 * U_TIME_1MS_IN_NS) {
+				dt_ns = 250 * U_TIME_1MS_IN_NS;
+			}
+			float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
+			float decay = expf(-dt / 0.2f);
+			float k = 0.2f * (1.0f - decay);
+			rel->pose.position.x += ctrl->linear_velocity.x * k;
+			rel->pose.position.y += ctrl->linear_velocity.y * k;
+			rel->pose.position.z += ctrl->linear_velocity.z * k;
+			rel->linear_velocity.x = ctrl->linear_velocity.x * decay;
+			rel->linear_velocity.y = ctrl->linear_velocity.y * decay;
+			rel->linear_velocity.z = ctrl->linear_velocity.z * decay;
+			rel->relation_flags |=
+			    (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
+		}
 	}
 	os_mutex_unlock(&ctrl->mutex);
 
 	m_relation_chain_resolve(&xrc, out_relation);
 
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+rift_s_controller_set_output(struct xrt_device *xdev,
+                             enum xrt_output_name name,
+                             const struct xrt_output_value *value)
+{
+	/* Haptics are not driven yet. Acknowledge quietly instead of falling
+	 * through to the not-implemented handler, which logs an error on every
+	 * call and floods limited log buffers. */
 	return XRT_SUCCESS;
 }
 
@@ -628,8 +759,8 @@ rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_
 		struct t_constellation_led *led = led_model->leds + i;
 		struct xrt_vec3 pos, dir;
 
-		math_pose_transform_point(&ctrl->P_device_imu, &ctrl->calibration.leds[i].pos, &pos);
-		math_quat_rotate_vec3(&ctrl->P_device_imu.orientation, &ctrl->calibration.leds[i].dir, &dir);
+		math_pose_transform_point(&ctrl->P_imu_device, &ctrl->calibration.leds[i].pos, &pos);
+		math_quat_rotate_vec3(&ctrl->P_imu_device.orientation, &ctrl->calibration.leds[i].dir, &dir);
 
 		led->id = i;
 		led->pos.x = pos.x;
@@ -651,48 +782,363 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
 	os_mutex_lock(&ctrl->mutex);
 
+	timepoint_ns prev_ts = ctrl->last_tracked_pose_ts;
+
+	/* Never let a non-finite PnP solve into the pipeline: one NaN poisons
+	 * the One-Euro filter, the velocity, the anchor and (via priors) future
+	 * solves permanently. Drop the frame instead. */
+	if (!isfinite(pose->position.x) || !isfinite(pose->position.y) || !isfinite(pose->position.z) ||
+	    !isfinite(pose->orientation.x) || !isfinite(pose->orientation.y) || !isfinite(pose->orientation.z) ||
+	    !isfinite(pose->orientation.w)) {
+		ctrl->diag_nan_count++;
+		CTRL_DIAG("DIAG %s NONFINITE optical solve dropped",
+		             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R");
+		os_mutex_unlock(&ctrl->mutex);
+		return;
+	}
+
+	/* Stale or duplicate observation (same or older capture time than the
+	 * anchor). Feeding it to the One-Euro filter would divide by dt=0 and
+	 * NaN the whole position pipeline, so drop it. */
+	if (prev_ts != 0 && frame_mono_ns <= prev_ts) {
+		ctrl->diag_stale_count++;
+		os_mutex_unlock(&ctrl->mutex);
+		return;
+	}
+
+	/* Continuity gate on the RAW observation, so rejected outliers never
+	 * touch the smoothing filter or the anchor. Predicts where the hand
+	 * should be from the last accepted pose plus optical velocity and
+	 * rejects absurd jumps: hand swaps when the controllers get close,
+	 * flipped PnP solutions, and mismatched blobs all move decimeters in
+	 * one 33 ms frame, which real hands cannot do. The gate scales with
+	 * speed so fast swings pass; it only engages in steady track (a valid
+	 * velocity estimate exists) and force-accepts after 10 consecutive
+	 * rejects so a bad anchor can never freeze the hand forever. Pure
+	 * linear prediction only - no integrated state, so this cannot
+	 * diverge: worst case it drops a third of a second of frames. */
+	if (ctrl->have_linear_velocity && prev_ts != 0 && frame_mono_ns > prev_ts) {
+		time_duration_ns gap_ns = frame_mono_ns - prev_ts;
+		if (gap_ns >= 15 * U_TIME_1MS_IN_NS && gap_ns <= 150 * U_TIME_1MS_IN_NS) {
+			float gap_s = (float)gap_ns / (float)U_TIME_1S_IN_NS;
+			struct xrt_vec3 predicted = {
+			    .x = ctrl->last_tracked_pose.position.x + ctrl->linear_velocity.x * gap_s,
+			    .y = ctrl->last_tracked_pose.position.y + ctrl->linear_velocity.y * gap_s,
+			    .z = ctrl->last_tracked_pose.position.z + ctrl->linear_velocity.z * gap_s,
+			};
+		float residual = m_vec3_len(m_vec3_sub(pose->position, predicted));
+			float speed = m_vec3_len(ctrl->linear_velocity);
+			float gate = 0.07f + 3.0f * speed * gap_s;
+			if (residual > gate && ctrl->optical_reject_count < 10) {
+				ctrl->optical_reject_count++;
+				ctrl->diag_reject_count++;
+				ctrl->yaw_consensus_count = 0;
+				CTRL_DIAG("DIAG %s REJECT residual=%.3fm gate=%.3fm pos=(%.3f,%.3f,%.3f)",
+				             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R",
+				             residual, gate, pose->position.x, pose->position.y,
+				             pose->position.z);
+				os_mutex_unlock(&ctrl->mutex);
+				return;
+			}
+			if (residual > gate) {
+				/* Force-accepted after 10 straight rejects: the anchor
+				 * may be wrong, so don't trust the old velocity -
+				 * drop it like a teleport to avoid coasting away on a
+				 * stale vector. It rebuilds from the new anchor. */
+				ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
+				ctrl->have_linear_velocity = false;
+				ctrl->pos_filter_initialized = false;
+			}
+		}
+	}
+	ctrl->optical_reject_count = 0;
+
+	timepoint_ns now_mono_ns = os_monotonic_get_ns();
+	ctrl->diag_opt_count++;
+
+	/* One-time geometry line per session: proves which calibration the
+	 * poses are built from (IMU-to-device offset, aim-to-grip offset,
+	 * IMU scales/offsets/rates). */
+	if (!ctrl->diag_config_logged) {
+		ctrl->diag_config_logged = true;
+		const char *side = ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R";
+		CTRL_DIAG("DIAG %s cfg calib=%d P_imu_device pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f) "
+		             "P_aim_grip pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f)",
+		             side, (int)ctrl->have_calibration, ctrl->P_imu_device.position.x,
+		             ctrl->P_imu_device.position.y, ctrl->P_imu_device.position.z,
+		             ctrl->P_imu_device.orientation.x, ctrl->P_imu_device.orientation.y,
+		             ctrl->P_imu_device.orientation.z, ctrl->P_imu_device.orientation.w,
+		             ctrl->P_aim_grip.position.x, ctrl->P_aim_grip.position.y, ctrl->P_aim_grip.position.z,
+		             ctrl->P_aim_grip.orientation.x, ctrl->P_aim_grip.orientation.y,
+		             ctrl->P_aim_grip.orientation.z, ctrl->P_aim_grip.orientation.w);
+		CTRL_DIAG("DIAG %s imuCfg config=%d accelScale=%.6f gyroScale=%.6f accelHz=%u gyroHz=%u "
+		             "accelOff=(%.4f,%.4f,%.4f) gyroOff=(%.4f,%.4f,%.4f)",
+		             side, (int)ctrl->have_config, ctrl->config.accel_scale, ctrl->config.gyro_scale,
+		             ctrl->config.accel_hz, ctrl->config.gyro_hz, ctrl->calibration.accel.offset.x,
+		             ctrl->calibration.accel.offset.y, ctrl->calibration.accel.offset.z,
+		             ctrl->calibration.gyro.offset.x, ctrl->calibration.gyro.offset.y,
+		             ctrl->calibration.gyro.offset.z);
+		/* LED cloud geometry in the raw calibration (device) frame: proves
+		 * the constellation model sits where the physical LEDs are. A
+		 * mirrored/offset cloud fits mirrored poses - systematically wrong
+		 * orientation with roughly-right position. */
+		if (ctrl->have_calibration && ctrl->calibration.num_leds > 0 && ctrl->calibration.leds != NULL) {
+			struct xrt_vec3 centroid = {0, 0, 0};
+			struct xrt_vec3 min_p = {1e9f, 1e9f, 1e9f};
+			struct xrt_vec3 max_p = {-1e9f, -1e9f, -1e9f};
+			for (int li = 0; li < ctrl->calibration.num_leds; li++) {
+				struct xrt_vec3 p = ctrl->calibration.leds[li].pos;
+				centroid.x += p.x;
+				centroid.y += p.y;
+				centroid.z += p.z;
+				if (p.x < min_p.x) {
+					min_p.x = p.x;
+				}
+				if (p.y < min_p.y) {
+					min_p.y = p.y;
+				}
+				if (p.z < min_p.z) {
+					min_p.z = p.z;
+				}
+				if (p.x > max_p.x) {
+					max_p.x = p.x;
+				}
+				if (p.y > max_p.y) {
+					max_p.y = p.y;
+				}
+				if (p.z > max_p.z) {
+					max_p.z = p.z;
+				}
+			}
+			float n = (float)ctrl->calibration.num_leds;
+			CTRL_DIAG("DIAG %s leds n=%d centroid=(%.4f,%.4f,%.4f) "
+			             "min=(%.4f,%.4f,%.4f) max=(%.4f,%.4f,%.4f) imuPos=(%.4f,%.4f,%.4f)",
+			             side, ctrl->calibration.num_leds, centroid.x / n, centroid.y / n,
+			             centroid.z / n, min_p.x, min_p.y, min_p.z, max_p.x, max_p.y, max_p.z,
+			             ctrl->calibration.imu_position.x, ctrl->calibration.imu_position.y,
+			             ctrl->calibration.imu_position.z);
+		}
+	}
+
+	// Run optical position observation through One-Euro filter to remove 30 Hz camera sensor discretization noise
+	struct xrt_vec3 filtered_pos;
+	if (!ctrl->pos_filter_initialized) {
+		m_filter_euro_vec3_init(&ctrl->pos_filter, 6.0, 1.0, 0.1);
+		ctrl->pos_filter_initialized = true;
+	}
+	m_filter_euro_vec3_run(&ctrl->pos_filter, (uint64_t)frame_mono_ns, &pose->position, &filtered_pos);
+
+	struct xrt_pose prev_pose = ctrl->last_tracked_pose;
+
 	ctrl->last_tracked_pose_ts = frame_mono_ns;
-	ctrl->last_tracked_pose = *pose;
+	ctrl->last_tracked_pose.position = filtered_pos;
+	ctrl->last_tracked_pose.orientation = pose->orientation;
+
+	if (prev_ts != 0 && frame_mono_ns > prev_ts) {
+		time_duration_ns dt_ns = frame_mono_ns - prev_ts;
+		// Normal inter-frame interval for ~30 FPS camera is ~33ms (allow 15ms to 150ms)
+		if (dt_ns >= 15 * U_TIME_1MS_IN_NS && dt_ns <= 150 * U_TIME_1MS_IN_NS) {
+			struct xrt_vec3 pos_diff = m_vec3_sub(filtered_pos, prev_pose.position);
+			float step_dist = m_vec3_len(pos_diff);
+			if (step_dist > 0.20f && dt_ns < 50 * U_TIME_1MS_IN_NS) {
+				// Sudden unphysical teleport (> 20cm in < 50ms) - reset velocity to prevent runaway extrapolation
+				ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
+				ctrl->have_linear_velocity = false;
+				ctrl->pos_filter_initialized = false;
+				ctrl->yaw_trust_count = 0;
+				ctrl->yaw_consensus_count = 0;
+				ctrl->diag_teleport_count++;
+				CTRL_DIAG(
+				    "DIAG %s TELEPORT step=%.3fm dtMs=%.1f pos=(%.3f,%.3f,%.3f)",
+				    ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R", step_dist,
+				    (float)dt_ns / (float)U_TIME_1MS_IN_NS, filtered_pos.x, filtered_pos.y,
+				    filtered_pos.z);
+			} else {
+				float dt = (float)dt_ns / (float)U_TIME_1S_IN_NS;
+				struct xrt_vec3 inst_vel = {
+				    .x = (filtered_pos.x - prev_pose.position.x) / dt,
+				    .y = (filtered_pos.y - prev_pose.position.y) / dt,
+				    .z = (filtered_pos.z - prev_pose.position.z) / dt,
+				};
+				// Clamp velocity to human limits (4.0 m/s) to prevent numerical spikes
+				float speed = m_vec3_len(inst_vel);
+				if (speed > 4.0f) {
+					float s = 4.0f / speed;
+					inst_vel.x *= s;
+					inst_vel.y *= s;
+					inst_vel.z *= s;
+				}
+				if (ctrl->have_linear_velocity) {
+					const float alpha = 0.35f;
+					ctrl->linear_velocity.x =
+					    alpha * inst_vel.x + (1.0f - alpha) * ctrl->linear_velocity.x;
+					ctrl->linear_velocity.y =
+					    alpha * inst_vel.y + (1.0f - alpha) * ctrl->linear_velocity.y;
+					ctrl->linear_velocity.z =
+					    alpha * inst_vel.z + (1.0f - alpha) * ctrl->linear_velocity.z;
+				} else {
+					ctrl->linear_velocity = inst_vel;
+					ctrl->have_linear_velocity = true;
+				}
+			}
+		} else if (dt_ns > 150 * U_TIME_1MS_IN_NS) {
+			// After tracking loss / freeze, reset velocity so the recovery teleport doesn't cause a spike
+			ctrl->linear_velocity = (struct xrt_vec3){0, 0, 0};
+			ctrl->have_linear_velocity = false;
+			ctrl->pos_filter_initialized = false;
+			ctrl->yaw_trust_count = 0;
+			ctrl->yaw_consensus_count = 0;
+			ctrl->diag_gap_count++;
+			CTRL_DIAG("DIAG %s GAP gapMs=%.1f pos=(%.3f,%.3f,%.3f)",
+			             ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R",
+			             (float)dt_ns / (float)U_TIME_1MS_IN_NS, filtered_pos.x, filtered_pos.y,
+			             filtered_pos.z);
+		}
+	}
+
+	if (ctrl->yaw_trust_count < 1000) {
+		ctrl->yaw_trust_count++;
+	}
 
 	if (ctrl->update_yaw_from_optical) {
-		// Apply 5% of observed orientation yaw to 3dof fusion
-		// FIXME: Do better
-		struct xrt_quat delta;
-		math_quat_unrotate(&ctrl->fusion.rot, &pose->orientation, &delta);
-		delta.x = delta.z = 0.0; // We only want Yaw
+		// Only correct yaw if the controller is relatively stationary.
+		// When the hand is rotating, the 1000 Hz gyroscope has zero latency
+		// whereas optical orientation is 20-30 ms stale. Snapping during motion
+		// causes severe rotational hitching.
+		// Additionally, only trust optical orientation after ~1.5 s of
+		// sustained solves: a bad (re)acquisition solve must not capture
+		// the fusion yaw while the hands are held still.
+		float gyro_speed = m_vec3_len(ctrl->fusion.last.gyro);
+		if (gyro_speed < 0.15f && ctrl->yaw_trust_count >= 45) { // < ~8.6 deg/s
+			// Calculate orientation error in WORLD coordinates:
+			// q_err = q_optical * q_fusion^-1
+			struct xrt_quat fusion_inv;
+			math_quat_invert(&ctrl->fusion.rot, &fusion_inv);
+			struct xrt_quat q_err;
+			math_quat_rotate(&pose->orientation, &fusion_inv, &q_err);
 
-		if (fabs(delta.y) > sin(DEG_TO_RAD(5)) / 2) {
-			delta.y = sin(0.10 * asinf(delta.y)); // 10% correction
-			math_quat_normalize(&delta);
-
-			struct xrt_quat prev = ctrl->fusion.rot;
-			math_quat_rotate(&ctrl->fusion.rot, &delta, &ctrl->fusion.rot);
-
-			if (rift_s_log_level <= U_LOGGING_DEBUG) {
-				struct xrt_quat post_delta;
-				math_quat_unrotate(&ctrl->fusion.rot, &pose->orientation, &post_delta);
-				post_delta.x = post_delta.z = 0.0;  // We only want Yaw
-				post_delta.y = 0.10 * post_delta.y; // 5%
-				math_quat_normalize(&post_delta);
-
-				RIFT_S_DEBUG(
-				    "Applying delta yaw rotation of %f degrees delta quat %f,%f,%f,%f from "
-				    "%f,%f,%f,%f to "
-				    "%f,%f,%f,%f. delta after correction: %f,%f,%f,%f",
-				    RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w, prev.x, prev.y,
-				    prev.z, prev.w, ctrl->fusion.rot.x, ctrl->fusion.rot.y, ctrl->fusion.rot.z,
-				    ctrl->fusion.rot.w, post_delta.x, post_delta.y, post_delta.z, post_delta.w);
+			/* Gate the correction. Gyro yaw drift accumulates at
+			 * degrees-per-minute, so a huge disagreement is a bad
+			 * optical solve, not drift - following it visibly rotates
+			 * still hands wrong. A near-zero yaw component would also
+			 * normalize to NaN and poison the fusion permanently. */
+			float yw_len_sq = q_err.y * q_err.y + q_err.w * q_err.w;
+			bool yaw_ok = yw_len_sq > 1e-12f;
+			float yaw_deg = 0.0f;
+			float yaw_signed_deg = 0.0f;
+			struct xrt_quat q_yaw = XRT_QUAT_IDENTITY;
+			if (yaw_ok) {
+				// In OpenXR world space, +Y is UP (gravity axis).
+				// Extract pure rotation around World Y:
+				q_yaw.x = 0.0f;
+				q_yaw.y = q_err.y;
+				q_yaw.z = 0.0f;
+				q_yaw.w = q_err.w;
+				math_quat_normalize(&q_yaw);
+				float yaw_w = fminf(fmaxf(fabsf(q_yaw.w), 0.0f), 1.0f);
+				yaw_deg = 2.0f * acosf(yaw_w) * 57.29578f;
+				yaw_signed_deg = 2.0f * atan2f(q_yaw.y, q_yaw.w) * 57.29578f;
+				yaw_ok = yaw_deg < 25.0f;
 			}
-		} else if (fabs(delta.y) > sin(DEG_TO_RAD(0.25)) / 2) {
-			math_quat_normalize(&delta);
+			if (!yaw_ok) {
+				ctrl->diag_yaw_bad_count++;
+				if (yaw_deg > ctrl->diag_max_yaw_err_deg) {
+					ctrl->diag_max_yaw_err_deg = yaw_deg;
+				}
+				/* Consensus repair: flips oscillate frame to frame,
+				 * but a genuinely wrong fusion yaw disagrees with good
+				 * optical solves by a STABLE large angle. After 6 still
+				 * frames agreeing within 10 degrees, apply the full
+				 * correction at once instead of never converging. */
+				if (yw_len_sq > 1e-12f) {
+					if (ctrl->yaw_consensus_count == 0 ||
+					    fabsf(yaw_signed_deg - ctrl->yaw_consensus_mean_deg) < 10.0f) {
+						ctrl->yaw_consensus_mean_deg =
+						    (ctrl->yaw_consensus_mean_deg *
+						         (float)ctrl->yaw_consensus_count +
+						     yaw_signed_deg) /
+						    (float)(ctrl->yaw_consensus_count + 1);
+						ctrl->yaw_consensus_count++;
+					} else {
+						ctrl->yaw_consensus_mean_deg = yaw_signed_deg;
+						ctrl->yaw_consensus_count = 1;
+					}
+					if (ctrl->yaw_consensus_count >= 6 &&
+					    fabsf(ctrl->yaw_consensus_mean_deg) > 25.0f) {
+						float half_rad = ctrl->yaw_consensus_mean_deg * 0.5f / 57.29578f;
+						struct xrt_quat snap = {0.0f, sinf(half_rad), 0.0f, cosf(half_rad)};
+						math_quat_rotate(&snap, &ctrl->fusion.rot, &ctrl->fusion.rot);
+						ctrl->diag_yaw_apply_count++;
+						ctrl->yaw_consensus_count = 0;
+						ctrl->yaw_consensus_mean_deg = 0.0f;
+					}
+				} else {
+					ctrl->yaw_consensus_count = 0;
+				}
+			} else {
+				// Small error: gentle nudge handles it; consensus is for large errors only.
+				ctrl->yaw_consensus_count = 0;
+				// Apply a gentle complementary filter nudge (2% per 33 ms frame)
+				struct xrt_quat correction;
+				const struct xrt_quat id = XRT_QUAT_IDENTITY;
+				math_quat_slerp(&id, &q_yaw, 0.02f, &correction);
 
-			RIFT_S_DEBUG("Applying full yaw correction of %f degrees. delta quat %f,%f,%f,%f",
-			             RAD_TO_DEG(2 * asinf(delta.y)), delta.x, delta.y, delta.z, delta.w);
-			math_quat_rotate(&ctrl->fusion.rot, &delta, &ctrl->fusion.rot);
+				// Apply correction on the left (in world space):
+				// q_fusion_new = correction * q_fusion
+				math_quat_rotate(&correction, &ctrl->fusion.rot, &ctrl->fusion.rot);
+
+				ctrl->diag_yaw_apply_count++;
+				if (yaw_deg > ctrl->diag_max_yaw_err_deg) {
+					ctrl->diag_max_yaw_err_deg = yaw_deg;
+				}
+			}
+		} else {
+			ctrl->diag_yaw_skip_count++;
 		}
 	}
 	// Update pose position for the debug UI
-	ctrl->pose.position = pose->position;
+	ctrl->pose.position = filtered_pos;
+
+	/* Periodic per-controller summary (every 2 s): the single line that
+	 * tells us whether tracking is healthy. IMU rate proves the radio
+	 * link, optical rate proves the constellation solver, max query age
+	 * proves freshness, |v| + teleport/gap counts prove stability, yaw
+	 * counts prove the still-hands correction behaviour, and stillLin
+	 * proves the accelerometer frame (expect ~0.00 when still). */
+	if (ctrl->diag_win_start_ns == 0) {
+		ctrl->diag_win_start_ns = now_mono_ns;
+		ctrl->diag_last_summary_ns = now_mono_ns;
+	}
+	if (now_mono_ns - ctrl->diag_last_summary_ns >= 2 * U_TIME_1S_IN_NS) {
+		float win_s =
+		    (float)(now_mono_ns - ctrl->diag_win_start_ns) / (float)U_TIME_1S_IN_NS;
+		float imu_hz = win_s > 0.0f ? (float)ctrl->diag_imu_count / win_s : 0.0f;
+		float opt_hz = win_s > 0.0f ? (float)ctrl->diag_opt_count / win_s : 0.0f;
+		float spd = ctrl->have_linear_velocity ? m_vec3_len(ctrl->linear_velocity) : 0.0f;
+		CTRL_DIAG(
+		    "DIAG %s sum imuHz=%.0f optHz=%.1f maxAgeMs=%.0f pos=(%.3f,%.3f,%.3f) spd=%.2f "
+		    "yawApply=%u yawMove=%u yawBad=%u yawMaxDeg=%.1f tele=%u gap=%u nan=%u stale=%u rej=%u stillLin=%.3f",
+		    ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "L" : "R", imu_hz, opt_hz,
+		    ctrl->diag_max_opt_age_ms, filtered_pos.x, filtered_pos.y, filtered_pos.z, spd,
+		    ctrl->diag_yaw_apply_count, ctrl->diag_yaw_skip_count, ctrl->diag_yaw_bad_count,
+		    ctrl->diag_max_yaw_err_deg, ctrl->diag_teleport_count, ctrl->diag_gap_count,
+		    ctrl->diag_nan_count, ctrl->diag_stale_count, ctrl->diag_reject_count,
+		    ctrl->diag_still_lin_accel_avg);
+		ctrl->diag_win_start_ns = now_mono_ns;
+		ctrl->diag_last_summary_ns = now_mono_ns;
+		ctrl->diag_imu_count = 0;
+		ctrl->diag_opt_count = 0;
+		ctrl->diag_teleport_count = 0;
+		ctrl->diag_gap_count = 0;
+		ctrl->diag_yaw_apply_count = 0;
+		ctrl->diag_yaw_skip_count = 0;
+		ctrl->diag_yaw_bad_count = 0;
+		ctrl->diag_nan_count = 0;
+		ctrl->diag_stale_count = 0;
+		ctrl->diag_reject_count = 0;
+		ctrl->diag_max_yaw_err_deg = 0.0f;
+		ctrl->diag_max_opt_age_ms = 0.0f;
+	}
 	os_mutex_unlock(&ctrl->mutex);
 }
 
@@ -719,14 +1165,11 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 
 	os_mutex_init(&ctrl->mutex);
 
-	/* Default grip pose up by 40° degrees around the X axis and back about 10cm in Z */
-	struct xrt_vec3 translation = {0.0, 0, 0.1};
-	struct xrt_vec3 axis = {1.0, 0, 0};
-	math_quat_from_angle_vector(DEG_TO_RAD(40), &axis, &ctrl->P_aim_grip.orientation);
-	ctrl->P_aim_grip.position = translation;
+	ctrl->pos_filter_initialized = false;
 
 	u_device_populate_function_pointers(&ctrl->base, rift_s_controller_get_tracked_pose, rift_s_controller_destroy);
 	ctrl->base.update_inputs = rift_s_controller_update_inputs;
+	ctrl->base.set_output = rift_s_controller_set_output;
 	ctrl->base.get_view_poses = u_device_get_view_poses;
 	ctrl->base.name = XRT_DEVICE_TOUCH_CONTROLLER;
 	ctrl->base.device_type = device_type;
@@ -734,11 +1177,19 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 	ctrl->base.supported.orientation_tracking = true;
 	ctrl->base.supported.position_tracking = true;
 
-
+	struct xrt_vec3 axis = {1.0f, 0.0f, 0.0f};
 	if (device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
 		ctrl->device_type = RIFT_S_DEVICE_LEFT_CONTROLLER;
+		ctrl->flip_left_yaw = debug_get_bool_option_flip_left_yaw();
+		struct xrt_vec3 translation = {0.007f, -0.0018f, 0.102f};
+		math_quat_from_angle_vector(DEG_TO_RAD(20.6f), &axis, &ctrl->P_aim_grip.orientation);
+		ctrl->P_aim_grip.position = translation;
 	} else {
 		ctrl->device_type = RIFT_S_DEVICE_RIGHT_CONTROLLER;
+		ctrl->flip_left_yaw = false;
+		struct xrt_vec3 translation = {-0.007f, -0.0018f, 0.102f};
+		math_quat_from_angle_vector(DEG_TO_RAD(20.6f), &axis, &ctrl->P_aim_grip.orientation);
+		ctrl->P_aim_grip.position = translation;
 	}
 
 	ctrl->pose.orientation.w = 1.0f; // All other values set to zero by U_DEVICE_ALLOCATE (which calls U_CALLOC)
@@ -786,6 +1237,9 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 	u_var_add_pose(ctrl, &ctrl->pose, "Tracked Pose");
 
 	u_var_add_pose(ctrl, &ctrl->P_aim_grip, "Grip pose offset");
+	if (device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
+		u_var_add_bool(ctrl, &ctrl->flip_left_yaw, "Flip Left Yaw (180 deg)");
+	}
 
 	u_var_add_gui_header(ctrl, NULL, "3DoF Tracking");
 	m_imu_3dof_add_vars(&ctrl->fusion, ctrl, "");
@@ -820,27 +1274,41 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
 	return ctrl;
 }
 
+#define RIFT_S_CONFIG_RETRY_INTERVAL_NS (1 * U_TIME_1S_IN_NS)
+
 void
 rift_s_controller_update_configuration(struct rift_s_controller *ctrl, uint64_t device_id)
 {
 	rift_s_radio_state *radio = rift_s_system_radio(ctrl->sys);
+	timepoint_ns now = os_monotonic_get_ns();
 
 	if (ctrl->device_id != device_id) {
 		ctrl->device_id = device_id;
 		snprintf(ctrl->base.serial, XRT_DEVICE_NAME_LEN, "%016" PRIx64, device_id);
 		// If the device ID changed somehow, re-read the JSON blocks
 		ctrl->have_config = ctrl->have_calibration = false;
+		ctrl->reading_config = ctrl->reading_calibration = false;
+		ctrl->last_config_attempt_ns = 0;
+		ctrl->last_calibration_attempt_ns = 0;
 	}
 
 	if (!ctrl->have_config && !ctrl->reading_config) {
-		const uint8_t config_req[] = {0x32, 0x20, 0xe8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-		rift_s_radio_queue_command(radio, ctrl->device_id, config_req, sizeof(config_req),
-		                           (rift_s_radio_completion_fn)ctrl_config_cb, ctrl);
-		ctrl->reading_config = true;
+		if (ctrl->last_config_attempt_ns == 0 ||
+		    (now - ctrl->last_config_attempt_ns) >= RIFT_S_CONFIG_RETRY_INTERVAL_NS) {
+			const uint8_t config_req[] = {0x32, 0x20, 0xe8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+			ctrl->last_config_attempt_ns = now;
+			ctrl->reading_config = true;
+			rift_s_radio_queue_command(radio, ctrl->device_id, config_req, sizeof(config_req),
+			                           (rift_s_radio_completion_fn)ctrl_config_cb, ctrl);
+		}
 	}
 
 	if (!ctrl->have_calibration && !ctrl->reading_calibration) {
-		rift_s_radio_get_json_block(radio, ctrl->device_id, (rift_s_radio_completion_fn)ctrl_json_cb, ctrl);
-		ctrl->reading_calibration = true;
+		if (ctrl->last_calibration_attempt_ns == 0 ||
+		    (now - ctrl->last_calibration_attempt_ns) >= RIFT_S_CONFIG_RETRY_INTERVAL_NS) {
+			ctrl->last_calibration_attempt_ns = now;
+			ctrl->reading_calibration = true;
+			rift_s_radio_get_json_block(radio, ctrl->device_id, (rift_s_radio_completion_fn)ctrl_json_cb, ctrl);
+		}
 	}
 }

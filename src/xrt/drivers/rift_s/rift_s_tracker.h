@@ -24,6 +24,7 @@
 #include "tracking/t_tracking.h"
 #include "tracking/t_constellation_tracking.h"
 
+#include "rift_s_clock_sync.h"
 #include "rift_s_firmware.h"
 
 /* Oculus Rift S HMD Tracking */
@@ -89,11 +90,24 @@ struct rift_s_tracker
 	uint64_t valid_clock_observations;
 	bool have_hw2mono;
 	time_duration_ns hw2mono;
-	timepoint_ns last_frame_time;
 
-	//! Adjustment to apply to camera timestamps to bring them into the
-	// same 32-bit range as the IMU times
-	int64_t camera_ts_offset;
+	//! Latest HMD clock observation, kept even while fusion submission is gated.
+	uint64_t latest_imu_device_timestamp_ns;
+	timepoint_ns latest_imu_local_timestamp_ns;
+
+	//! Camera timestamp mapping and per-consumer monotonic guards.
+	struct rift_s_clock_sync camera_clock;
+	timepoint_ns last_slam_frame_time;
+	timepoint_ns last_controller_frame_time;
+
+	//! Rate limiting/counters for timestamp diagnostics.
+	timepoint_ns last_timestamp_diag_log_ns;
+	timepoint_ns last_timestamp_candidate_log_ns;
+	timepoint_ns last_slam_timestamp_log_ns;
+	timepoint_ns last_controller_timestamp_log_ns;
+	uint64_t suppressed_timestamp_diagnostics;
+	uint64_t camera_timestamp_resync_count;
+	uint64_t camera_timestamp_drop_count;
 
 	//! Whether to track the HMD with 6dof SLAM or fallback to the `fusion` 3dof tracker
 	bool slam_over_3dof;

@@ -67,6 +67,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(rift_s_slam, "RIFT_S_SLAM", true)
 //! Specifies whether the user wants to use the hand tracker.
 DEBUG_GET_ONCE_BOOL_OPTION(rift_s_handtracking, "RIFT_S_HANDTRACKING", true)
 
+//! Log one camera/IMU timestamp sample per second for each camera stream.
+DEBUG_GET_ONCE_BOOL_OPTION(rift_s_timestamp_log, "RIFT_S_TIMESTAMP_LOG", false)
+
 #ifdef XRT_FEATURE_SLAM
 DEBUG_GET_ONCE_OPTION(slam_submit_from_start, "SLAM_SUBMIT_FROM_START", NULL)
 #endif
@@ -363,6 +366,10 @@ rift_s_tracker_add_debug_ui(struct rift_s_tracker *t, void *root)
 {
 	u_var_add_gui_header(root, NULL, "Tracking");
 
+	if (t->base.tracking_origin != NULL) {
+		u_var_add_f32(root, &t->base.tracking_origin->initial_offset.position.y, "Floor Height (Y Offset)");
+	}
+
 	if (t->tracking.slam_enabled) {
 		t->gui.switch_tracker_btn.cb = rift_s_tracker_switch_method_cb;
 		t->gui.switch_tracker_btn.ptr = t;
@@ -376,6 +383,9 @@ rift_s_tracker_add_debug_ui(struct rift_s_tracker *t, void *root)
 
 	u_var_add_gui_header(root, NULL, "SLAM Tracking");
 	u_var_add_ro_text(root, t->gui.slam_status, "Tracker status");
+	u_var_add_ro_i64(root, &t->camera_clock.camera_ts_offset_ns, "Camera timestamp offset (ns)");
+	u_var_add_ro_u64(root, &t->camera_timestamp_resync_count, "Camera timestamp resyncs");
+	u_var_add_ro_u64(root, &t->camera_timestamp_drop_count, "Camera timestamp drops");
 
 	u_var_add_gui_header(root, NULL, "Hand Tracking");
 	u_var_add_ro_text(root, t->gui.hand_status, "Tracker status");
@@ -547,6 +557,8 @@ void
 rift_s_tracker_clock_update(struct rift_s_tracker *t, uint64_t device_timestamp_ns, timepoint_ns local_timestamp_ns)
 {
 	os_mutex_lock(&t->mutex);
+	t->latest_imu_device_timestamp_ns = device_timestamp_ns;
+	t->latest_imu_local_timestamp_ns = local_timestamp_ns;
 	time_duration_ns last_hw2mono = t->hw2mono;
 	const float freq = 250.0;
 
@@ -576,10 +588,19 @@ rift_s_tracker_clock_update(struct rift_s_tracker *t, uint64_t device_timestamp_
 }
 
 //! Camera specific logic for clock conversion
-static void
+static bool
 clock_hw2mono_get(struct rift_s_tracker *t, uint64_t device_ts, timepoint_ns *out)
 {
-	*out = t->hw2mono + device_ts;
+	if (device_ts > INT64_MAX) {
+		return false;
+	}
+	timepoint_ns signed_device_ts = (timepoint_ns)device_ts;
+	if ((t->hw2mono > 0 && signed_device_ts > INT64_MAX - t->hw2mono) ||
+	    (t->hw2mono < 0 && signed_device_ts < INT64_MIN - t->hw2mono)) {
+		return false;
+	}
+	*out = t->hw2mono + signed_device_ts;
+	return true;
 }
 
 void
@@ -591,7 +612,7 @@ rift_s_tracker_imu_update(struct rift_s_tracker *t,
 	os_mutex_lock(&t->mutex);
 
 	/* Ignore packets before we're ready and clock is stable */
-	if (!t->ready_for_data || !t->have_hw2mono || t->last_frame_time == 0) {
+	if (!t->ready_for_data || !t->have_hw2mono || t->last_slam_frame_time == 0) {
 		os_mutex_unlock(&t->mutex);
 		return;
 	}
@@ -599,7 +620,11 @@ rift_s_tracker_imu_update(struct rift_s_tracker *t,
 	/* Get the smoothed monotonic time estimate for this IMU sample */
 	timepoint_ns local_timestamp_ns;
 
-	clock_hw2mono_get(t, device_timestamp_ns, &local_timestamp_ns);
+	if (!clock_hw2mono_get(t, device_timestamp_ns, &local_timestamp_ns)) {
+		RIFT_S_WARN("Invalid IMU timestamp during monotonic clock conversion");
+		os_mutex_unlock(&t->mutex);
+		return;
+	}
 
 	if (t->fusion.last_imu_local_timestamp_ns != 0 && local_timestamp_ns < t->fusion.last_imu_local_timestamp_ns) {
 		RIFT_S_WARN("IMU time went backward by %" PRId64 " ns",
@@ -632,30 +657,95 @@ rift_s_tracker_imu_update(struct rift_s_tracker *t,
 	}
 }
 
-#define UPPER_32BITS(x) ((x) & 0xffffffff00000000ULL)
-
-// Called with tracker mutex held
-static timepoint_ns
-raw_frame_ts_to_mono_ts(struct rift_s_tracker *t, uint64_t frame_ts_ns)
+static bool
+rift_s_tracker_should_log_timestamp_diagnostic(struct rift_s_tracker *t, timepoint_ns *last_log_ns)
 {
-	timepoint_ns frame_time;
-
-	/* Ensure the input timestamp is within 32-bits of the IMU
-	 * time, because the timestamps are reported and extended to 64-bits
-	 * separately and can end up in different epochs */
-	uint64_t adj_frame_ts_ns = frame_ts_ns + t->camera_ts_offset;
-	int64_t frame_to_imu_uS = (adj_frame_ts_ns / 1000 - t->fusion.last_imu_timestamp_ns / 1000);
-
-	if (frame_to_imu_uS < -(int64_t)(1ULL << 31) || frame_to_imu_uS > (int64_t)(1ULL << 31)) {
-		t->camera_ts_offset =
-		    (UPPER_32BITS(t->fusion.last_imu_timestamp_ns / 1000) - UPPER_32BITS(frame_ts_ns / 1000)) * 1000;
-		RIFT_S_DEBUG("Applying epoch offset to frame times of %" PRId64 " (frame->imu was %" PRId64 " µS)",
-		             t->camera_ts_offset, frame_to_imu_uS);
+	timepoint_ns now_ns = os_monotonic_get_ns();
+	if (*last_log_ns == 0 || now_ns - *last_log_ns >= U_TIME_1S_IN_NS) {
+		*last_log_ns = now_ns;
+		return true;
 	}
-	frame_ts_ns += t->camera_ts_offset;
+	t->suppressed_timestamp_diagnostics++;
+	return false;
+}
 
-	clock_hw2mono_get(t, frame_ts_ns, &frame_time);
-	return frame_time;
+// Called with tracker mutex held.
+static enum rift_s_clock_sync_result
+raw_frame_ts_to_mono_ts(struct rift_s_tracker *t,
+                        uint64_t frame_ts_ns,
+                        timepoint_ns *out_frame_time,
+                        struct rift_s_clock_sync_sample *out_sample)
+{
+	enum rift_s_clock_sync_result result =
+	    rift_s_clock_sync_push(&t->camera_clock, frame_ts_ns, t->latest_imu_device_timestamp_ns, out_sample);
+	if (result == RIFT_S_CLOCK_SYNC_OK || result == RIFT_S_CLOCK_SYNC_RESYNCED) {
+		if (!clock_hw2mono_get(t, (uint64_t)out_sample->adjusted_camera_ns, out_frame_time)) {
+			return RIFT_S_CLOCK_SYNC_INVALID;
+		}
+	}
+	return result;
+}
+
+// Called with tracker mutex held.
+static void
+rift_s_tracker_log_timestamp_diagnostic(struct rift_s_tracker *t,
+                                        const char *stream,
+                                        enum rift_s_clock_sync_result result,
+                                        const struct rift_s_clock_sync_sample *sample,
+                                        timepoint_ns previous_frame_time,
+                                        timepoint_ns frame_time)
+{
+	bool waiting = result == RIFT_S_CLOCK_SYNC_WAITING_FOR_CONFIRMATION;
+	timepoint_ns *last_log_ns = waiting ? &t->last_timestamp_candidate_log_ns : &t->last_timestamp_diag_log_ns;
+	if (!rift_s_tracker_should_log_timestamp_diagnostic(t, last_log_ns)) {
+		return;
+	}
+
+#define RIFT_S_TIMESTAMP_DIAGNOSTIC(LOG)                                                                               \
+	LOG("%s camera timestamp abnormal: raw=%" PRIu64 " adjusted=%" PRId64 " previous_mono=%" PRId64                \
+	    " computed_mono=%" PRId64 " mono_delta=%" PRId64 " latest_imu_raw=%" PRIu64 " latest_imu_local=%" PRId64   \
+	    " last_fused_imu_raw=%" PRIu64 " last_fused_imu_local=%" PRId64 " frame_to_imu=%" PRId64                   \
+	    " offset=%" PRId64 " hw2mono=%" PRId64 " have_hw2mono=%s observations=%" PRIu64                            \
+	    " resync=%s result=%d suppressed=%" PRIu64,                                                                \
+	    stream, sample->raw_camera_ns, sample->adjusted_camera_ns, previous_frame_time, frame_time,                \
+	    frame_time - previous_frame_time, t->latest_imu_device_timestamp_ns, t->latest_imu_local_timestamp_ns,     \
+	    t->fusion.last_imu_timestamp_ns, t->fusion.last_imu_local_timestamp_ns, sample->frame_to_imu_ns,           \
+	    sample->camera_ts_offset_ns, t->hw2mono, t->have_hw2mono ? "yes" : "no", t->valid_clock_observations,      \
+	    sample->resynchronized ? "yes" : "no", result, t->suppressed_timestamp_diagnostics)
+
+	if (waiting) {
+		RIFT_S_TIMESTAMP_DIAGNOSTIC(RIFT_S_DEBUG);
+	} else {
+		RIFT_S_TIMESTAMP_DIAGNOSTIC(RIFT_S_WARN);
+	}
+#undef RIFT_S_TIMESTAMP_DIAGNOSTIC
+	t->suppressed_timestamp_diagnostics = 0;
+}
+
+// Called with tracker mutex held.
+static void
+rift_s_tracker_log_periodic_timestamp(struct rift_s_tracker *t,
+                                      const char *stream,
+                                      const struct rift_s_clock_sync_sample *sample,
+                                      timepoint_ns frame_time,
+                                      timepoint_ns *last_log_ns)
+{
+	if (!debug_get_bool_option_rift_s_timestamp_log()) {
+		return;
+	}
+
+	timepoint_ns now_ns = os_monotonic_get_ns();
+	if (*last_log_ns != 0 && now_ns - *last_log_ns < U_TIME_1S_IN_NS) {
+		return;
+	}
+	*last_log_ns = now_ns;
+
+	RIFT_S_INFO("%s camera timestamp: raw=%" PRIu64 " adjusted=%" PRId64 " mono=%" PRId64
+	            " latest_imu_raw=%" PRIu64 " latest_imu_local=%" PRId64 " frame_to_imu=%" PRId64
+	            " offset=%" PRId64 " processing_latency=%" PRId64,
+	            stream, sample->raw_camera_ns, sample->adjusted_camera_ns, frame_time,
+	            t->latest_imu_device_timestamp_ns, t->latest_imu_local_timestamp_ns, sample->frame_to_imu_ns,
+	            sample->camera_ts_offset_ns, now_ns - frame_time);
 }
 
 void
@@ -679,16 +769,32 @@ rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
 	}
 
 
-	timepoint_ns frame_mono_ns = raw_frame_ts_to_mono_ts(t, frame_ts_ns);
-	if (frame_mono_ns < t->last_frame_time) {
-		RIFT_S_WARN("Camera frame time went backward by %" PRId64 " ns", frame_mono_ns - t->last_frame_time);
+	timepoint_ns frame_mono_ns = 0;
+	struct rift_s_clock_sync_sample sample = {0};
+	enum rift_s_clock_sync_result sync_result = raw_frame_ts_to_mono_ts(t, frame_ts_ns, &frame_mono_ns, &sample);
+	if (sync_result == RIFT_S_CLOCK_SYNC_WAITING_FOR_CONFIRMATION || sync_result == RIFT_S_CLOCK_SYNC_INVALID) {
+		t->camera_timestamp_drop_count++;
+		rift_s_tracker_log_timestamp_diagnostic(t, "SLAM", sync_result, &sample, t->last_slam_frame_time, 0);
 		os_mutex_unlock(&t->mutex);
 		return;
 	}
+	if (sync_result == RIFT_S_CLOCK_SYNC_RESYNCED) {
+		t->camera_timestamp_resync_count++;
+		rift_s_tracker_log_timestamp_diagnostic(t, "SLAM", sync_result, &sample, t->last_slam_frame_time,
+		                                        frame_mono_ns);
+	}
+	if (frame_mono_ns < t->last_slam_frame_time) {
+		t->camera_timestamp_drop_count++;
+		rift_s_tracker_log_timestamp_diagnostic(t, "SLAM", sync_result, &sample, t->last_slam_frame_time,
+		                                        frame_mono_ns);
+		os_mutex_unlock(&t->mutex);
+		return;
+	}
+	rift_s_tracker_log_periodic_timestamp(t, "SLAM", &sample, frame_mono_ns, &t->last_slam_timestamp_log_ns);
 
 	RIFT_S_TRACE("SLAM frame timestamp %" PRIu64 " local %" PRIu64, frame_ts_ns, frame_mono_ns);
 
-	t->last_frame_time = frame_mono_ns;
+	t->last_slam_frame_time = frame_mono_ns;
 	os_mutex_unlock(&t->mutex);
 
 	for (int i = 0; i < RIFT_S_CAMERA_COUNT; i++) {
@@ -727,7 +833,31 @@ rift_s_tracker_push_controller_frameset(struct rift_s_tracker *t, uint64_t frame
 		return;
 	}
 
-	timepoint_ns frame_mono_ns = raw_frame_ts_to_mono_ts(t, frame_ts_ns);
+	timepoint_ns frame_mono_ns = 0;
+	struct rift_s_clock_sync_sample sample = {0};
+	enum rift_s_clock_sync_result sync_result = raw_frame_ts_to_mono_ts(t, frame_ts_ns, &frame_mono_ns, &sample);
+	if (sync_result == RIFT_S_CLOCK_SYNC_WAITING_FOR_CONFIRMATION || sync_result == RIFT_S_CLOCK_SYNC_INVALID) {
+		t->camera_timestamp_drop_count++;
+		rift_s_tracker_log_timestamp_diagnostic(t, "controller", sync_result, &sample,
+		                                        t->last_controller_frame_time, 0);
+		os_mutex_unlock(&t->mutex);
+		return;
+	}
+	if (sync_result == RIFT_S_CLOCK_SYNC_RESYNCED) {
+		t->camera_timestamp_resync_count++;
+		rift_s_tracker_log_timestamp_diagnostic(t, "controller", sync_result, &sample,
+		                                        t->last_controller_frame_time, frame_mono_ns);
+	}
+	if (frame_mono_ns < t->last_controller_frame_time) {
+		t->camera_timestamp_drop_count++;
+		rift_s_tracker_log_timestamp_diagnostic(t, "controller", sync_result, &sample,
+		                                        t->last_controller_frame_time, frame_mono_ns);
+		os_mutex_unlock(&t->mutex);
+		return;
+	}
+	rift_s_tracker_log_periodic_timestamp(t, "controller", &sample, frame_mono_ns,
+	                                      &t->last_controller_timestamp_log_ns);
+	t->last_controller_frame_time = frame_mono_ns;
 	os_mutex_unlock(&t->mutex);
 
 	if (t->controller_sink) {

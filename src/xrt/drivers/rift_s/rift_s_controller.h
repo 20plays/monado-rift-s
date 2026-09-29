@@ -16,6 +16,7 @@
 #define RIFT_S_CONTROLLER_H
 
 #include "math/m_imu_3dof.h"
+#include "math/m_filter_one_euro.h"
 
 #include "os/os_time.h"
 #include "tracking/t_constellation_tracking.h"
@@ -57,8 +58,45 @@ struct rift_s_controller
 	timepoint_ns last_tracked_pose_ts;
 	//! Last tracked pose from optical controller tracking
 	struct xrt_pose last_tracked_pose;
+	//! Filtered linear velocity from optical observations
+	struct xrt_vec3 linear_velocity;
+	bool have_linear_velocity;
+	//! One-Euro position filter for optical observations
+	struct m_filter_euro_vec3 pos_filter;
+	bool pos_filter_initialized;
 	//! debug boolean - enable yaw updates
 	bool update_yaw_from_optical;
+	//! Accepted optical frames since (re)acquisition; the yaw nudge only
+	//! trusts optical orientation after sustained consistent solves, so a
+	//! bad first solve (e.g. controllers in a bad spot at startup) can not
+	//! capture the fusion yaw.
+	uint32_t yaw_trust_count;
+	//! Consecutive optical frames rejected by the continuity gate.
+	uint32_t optical_reject_count;
+	//! Stable large-error consensus for yaw repair (mean/count of signed
+	//! yaw errors agreeing within 10 degrees while still).
+	float yaw_consensus_mean_deg;
+	uint32_t yaw_consensus_count;
+
+	/* Tracking-quality diagnostics (all counters reset each summary window).
+	 * Visible with RIFT_S_LOG=debug; used to tune tracking toward Windows
+	 * parity with real session data instead of guesses. */
+	timepoint_ns diag_win_start_ns;
+	timepoint_ns diag_last_summary_ns;
+	uint32_t diag_imu_count;
+	uint32_t diag_opt_count;
+	uint32_t diag_teleport_count;
+	uint32_t diag_gap_count;
+	uint32_t diag_yaw_apply_count;
+	uint32_t diag_yaw_skip_count;
+	uint32_t diag_yaw_bad_count;
+	uint32_t diag_nan_count;
+	uint32_t diag_stale_count;
+	uint32_t diag_reject_count;
+	float diag_max_yaw_err_deg;
+	float diag_max_opt_age_ms;
+	float diag_still_lin_accel_avg;
+	bool diag_config_logged;
 
 	/* Debug logs */
 	/* 0x04 = new log line
@@ -91,6 +129,9 @@ struct rift_s_controller
 	//! Offset for grip pose
 	struct xrt_pose P_aim_grip;
 
+	//! Flip left controller yaw by 180 degrees (for in-game orientation correction)
+	bool flip_left_yaw;
+
 	/* Controls / buttons state */
 	timepoint_ns last_controls_local_time_ns;
 
@@ -116,10 +157,12 @@ struct rift_s_controller
 
 	bool reading_config;
 	bool have_config;
+	timepoint_ns last_config_attempt_ns;
 	rift_s_controller_config config;
 
 	bool reading_calibration;
 	bool have_calibration;
+	timepoint_ns last_calibration_attempt_ns;
 	struct rift_s_controller_imu_calibration calibration;
 };
 

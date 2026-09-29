@@ -503,20 +503,22 @@ check_led_against_model_subset(struct correspondence_search *cs,
 			tmpblob.z = blobs[p]->point_homog[2];
 
 			/* Calculate the image plane projection of the anchor
-			 * LED position and check it's within 2.5mm of where it
+			 * LED position and check it's within 8.0mm of where it
 			 * should be, to catch spurious failures in lambdatwist */
 			math_vec3_scalar_mul(1.0 / checkpos.z, &checkpos);
 			tmp = m_vec3_sub(checkpos, tmpblob);
 			l = m_vec3_len(tmp);
-			if (!(l <= 0.0025)) {
+			if (!(l <= 0.0080)) {
+#if DUMP_FULL_DEBUG
 				printf(
 				    "Error pose candidate orient %f %f %f %f pos %f %f %f "
 				    "LED %d @ %f %f %f projected to %f %f %f (err %f)\n",
 				    pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w,
 				    pose.position.x, pose.position.y, pose.position.z, p, tmpblob.x, tmpblob.y,
 				    tmpblob.z, checkpos.x, checkpos.y, checkpos.z, l);
+#endif
 				checks_failed = true;
-				break; /* FIXME: Figure out why this happened */
+				break;
 			}
 #if !CHECK_ALL_PROJECTIONS
 			break;

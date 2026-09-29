@@ -147,25 +147,36 @@ ransac_pnp_pose(struct xrt_pose *pose,
 	/* 3 pixel reprojection threshold */
 	float reprojectionError = 3.0 / calib->calib.fx;
 
-	cv::solvePnPRansac(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec, false, iterationsCount,
-	                   reprojectionError, confidence, inliers, flags);
+	/* The return status matters: on failure rvec/tvec keep their seeds,
+	 * and a zero rotation vector below would divide by zero and NaN the
+	 * orientation (which then poisons filters, priors and future solves
+	 * downstream). Bail out instead, keeping the input pose. */
+	bool solved = cv::solvePnPRansac(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec,
+	                                 false, iterationsCount, reprojectionError, confidence, inliers, flags);
+	if (!solved) {
+		if (num_inliers)
+			*num_inliers = 0;
+		return false;
+	}
 
 	if (num_inliers)
 		*num_inliers = inliers.rows;
 
-	struct xrt_vec3 v;
-	double angle = sqrt(rvec.dot(rvec));
-	double inorm = 1.0f / angle;
-
-	v.x = rvec.at<double>(0) * inorm;
-	v.y = rvec.at<double>(1) * inorm;
-	v.z = rvec.at<double>(2) * inorm;
-	math_quat_from_angle_vector(angle, &v, &pose->orientation);
+	/* Position refined by the solver is always usable on success. */
 	pose->position.x = tvec.at<double>(0);
 	pose->position.y = tvec.at<double>(1);
 	pose->position.z = tvec.at<double>(2);
 
-	U_LOG_T("Got PnP pose quat %f %f %f %f  pos %f %f %f", pose->orientation.x, pose->orientation.y,
-	        pose->orientation.z, pose->orientation.w, pose->position.x, pose->position.y, pose->position.z);
+	struct xrt_vec3 v;
+	double angle = sqrt(rvec.dot(rvec));
+	if (!(angle > 1e-12)) {
+		/* Degenerate zero rotation: keep the input orientation. */
+		return inliers.rows >= 4;
+	}
+	double inorm = 1.0f / angle;
+	v.x = rvec.at<double>(0) * inorm;
+	v.y = rvec.at<double>(1) * inorm;
+	v.z = rvec.at<double>(2) * inorm;
+	math_quat_from_angle_vector(angle, &v, &pose->orientation);
 	return true;
 }
